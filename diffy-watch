@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: diffy-watch [sbs] [-n SECONDS] [DIRECTORY] [-- DIFF_ARGS...]
+
+Refreshes a tmux-friendly diff view when staged, unstaged, or untracked
+changes in a Git worktree change.
+
+While running:
+  r  manual refresh
+  s  side by side diffs
+  i  inline diffs
+  n  toggle line numbers
+  /  set file filter
+  c  clear file filter
+  +  increase context lines
+  -  decrease context lines
+  f  files/status only
+  d  files/status only
+  l  launch lazygit
+
+Examples:
+  diffy-watch
+  diffy-watch sbs
+  diffy-watch -n 1 ~/Workspace/gapinc/nma-services
+  diffy-watch sbs . -- packages/foo/src/file.ts
+EOF
+}
+
+mode="inline"
+last_diff_mode="inline"
+show_line_numbers="on"
+sed_filter=""
+context_lines="3"
+interval="2"
+directory="."
+diff_args=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    sbs|--sbs)
+      mode="sbs"
+      shift
+      ;;
+    -n|--interval)
+      interval="${2:-}"
+      if [ -z "$interval" ]; then
+        echo "diffy-watch: missing interval value" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      diff_args=("$@")
+      break
+      ;;
+    *)
+      directory="$1"
+      shift
+      ;;
+  esac
+done
+
+cd "$directory"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "diffy-watch: not inside a Git worktree: $directory" >&2
+  exit 1
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+make_signature() {
+  git add -N . >/dev/null 2>&1 || true
+  {
+    git status --porcelain=v1 -uall
+    git diff --staged --binary -- "${diff_args[@]}"
+    git diff --binary -- "${diff_args[@]}"
+  } | git hash-object --stdin
+}
+
+apply_sed_filter() {
+  cat
+}
+
+pill() {
+  local fg="$1"
+  local bg="$2"
+  local text="$3"
+
+  printf '\033[38;5;%sm\033[38;5;%s;48;5;%sm %s \033[0m\033[38;5;%sm\033[0m' \
+    "$bg" "$fg" "$bg" "$text" "$bg"
+}
+
+key_hint() {
+  local key="$1"
+  local label="$2"
+
+  printf '\033[38;5;244m[\033[38;5;255m%s\033[38;5;244m]\033[0m \033[38;5;252m%s\033[0m' \
+    "$key" "$label"
+}
+
+section_header() {
+  local fg="$1"
+  local bg="$2"
+  local label="$3"
+
+  printf '\n'
+  pill "$fg" "$bg" "$label"
+  printf '\n'
+}
+
+path_matches_filter() {
+  local path="$1"
+
+  if [ -z "$sed_filter" ]; then
+    return 0
+  fi
+
+  case "$path" in
+    *"$sed_filter"*)
+      return 0
+      ;;
+  esac
+
+  if [ -f "$path" ] && grep -I -F -q -- "$sed_filter" "$path"; then
+    return 0
+  fi
+
+  if git --no-pager diff --color=never --staged -- "$path" | grep -F -q -- "$sed_filter"; then
+    return 0
+  fi
+
+  if git --no-pager diff --color=never -- "$path" | grep -F -q -- "$sed_filter"; then
+    return 0
+  fi
+
+  return 1
+}
+
+build_filtered_paths() {
+  filtered_paths=()
+
+  if [ -z "$sed_filter" ]; then
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    path="${line#?? }"
+    if path_matches_filter "$path"; then
+      filtered_paths+=("$path")
+    fi
+  done < <(git status --short -uall)
+}
+
+render() {
+  git add -N . >/dev/null 2>&1 || true
+  build_filtered_paths
+  context_args=(-U"$context_lines")
+  delta_args=(
+    --paging=never
+    --plus-style="syntax 22"
+    --plus-emph-style="syntax 28"
+    --plus-empty-line-marker-style="normal 22"
+    --minus-style="normal 52"
+    --minus-emph-style="normal 124"
+    --minus-empty-line-marker-style="normal 52"
+  )
+  if [ "$show_line_numbers" = "on" ]; then
+    delta_args+=(--line-numbers)
+  fi
+  if [ "$mode" = "sbs" ]; then
+    delta_args+=(--side-by-side)
+  fi
+
+  clear 2>/dev/null || printf '\033[H\033[2J'
+  case "$mode" in
+    sbs)
+      mode_label="sbs"
+      ;;
+    status)
+      mode_label="status"
+      ;;
+    *)
+      mode_label="inline"
+      ;;
+  esac
+
+  pill 15 39 "⚡👀 diffy-watch"
+  printf '  '
+  pill 15 60 "$mode_label"
+  printf '  \033[38;5;111m%s\033[0m  \033[38;5;246m%s\033[0m\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" "$repo_root"
+
+  printf '\033[38;5;244mControls\033[0m  '
+  key_hint "r" "refresh"
+  printf '  '
+  key_hint "s" "sbs"
+  printf '  '
+  key_hint "i" "inline"
+  printf '  '
+  key_hint "n" "line nums"
+  printf '  '
+  key_hint "/" "filter"
+  printf '  '
+  key_hint "+/-" "context"
+  printf '  '
+  key_hint "f/d" "status"
+  printf '  '
+  key_hint "l" "lazygit"
+  printf '\n'
+  printf '\033[38;5;244mContext\033[0m   \033[38;5;255m%s lines\033[0m\n' "$context_lines"
+  if [ -n "$sed_filter" ]; then
+    printf '\033[38;5;244mFilter\033[0m    \033[38;5;255m%s\033[0m\n' "$sed_filter"
+  fi
+
+  section_header 15 39 "STATUS"
+  if [ -n "$sed_filter" ]; then
+    if [ "${#filtered_paths[@]}" -gt 0 ]; then
+      git status --short -uall -- "${filtered_paths[@]}"
+    else
+      printf '(no matching files)\n'
+    fi
+  else
+    git status --short -uall
+  fi
+
+  if [ "$mode" != "status" ]; then
+    section_header 15 28 "STAGED"
+    if [ -n "$sed_filter" ]; then
+      if [ "${#filtered_paths[@]}" -gt 0 ]; then
+        git --no-pager diff --color=always --staged "${context_args[@]}" -- "${filtered_paths[@]}" | delta "${delta_args[@]}"
+      fi
+    else
+      git --no-pager diff --color=always --staged "${context_args[@]}" -- "${diff_args[@]}" | delta "${delta_args[@]}"
+    fi
+
+    section_header 16 214 "UNSTAGED + UNTRACKED"
+    if [ -n "$sed_filter" ]; then
+      if [ "${#filtered_paths[@]}" -gt 0 ]; then
+        git --no-pager diff --color=always "${context_args[@]}" -- "${filtered_paths[@]}" | delta "${delta_args[@]}"
+      fi
+    else
+      git --no-pager diff --color=always "${context_args[@]}" -- "${diff_args[@]}" | delta "${delta_args[@]}"
+    fi
+  fi
+}
+
+launch_lazygit() {
+  clear 2>/dev/null || printf '\033[H\033[2J'
+  command lazygit
+}
+
+restore_tmux_focus() {
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    tmux select-pane -t "$TMUX_PANE" >/dev/null 2>&1 || true
+  fi
+}
+
+prompt_sed_filter() {
+  local input=""
+  local rows=""
+  local prompt="file filter (blank clears): "
+  local prompt_row=""
+  local prompt_col=""
+
+  rows="$(tput lines 2>/dev/null || printf '24')"
+  prompt_row="$rows"
+  prompt_col="1"
+
+  printf '\0337'
+  printf '\033[%s;%sH\033[0K%s' "$prompt_row" "$prompt_col" "$prompt"
+  if ! IFS= read -r input; then
+    printf '\0338'
+    return 1
+  fi
+  printf '\0338'
+  sed_filter="$input"
+}
+
+last_signature=""
+resize_pending=0
+
+trap 'resize_pending=1' WINCH
+
+while true; do
+  force_render=0
+  key=""
+  if [ "$resize_pending" -eq 1 ]; then
+    force_render=1
+    resize_pending=0
+    restore_tmux_focus
+  fi
+  if IFS= read -rsn1 -t "$interval" key; then
+    case "$key" in
+      r)
+        force_render=1
+        ;;
+      s)
+        if [ "$mode" = "sbs" ]; then
+          mode="inline"
+        else
+          last_diff_mode="$mode"
+          mode="sbs"
+        fi
+        if [ "$mode" != "status" ]; then
+          last_diff_mode="$mode"
+        fi
+        force_render=1
+        ;;
+      i)
+        if [ "$mode" = "inline" ]; then
+          mode="sbs"
+        else
+          last_diff_mode="$mode"
+          mode="inline"
+        fi
+        if [ "$mode" != "status" ]; then
+          last_diff_mode="$mode"
+        fi
+        force_render=1
+        ;;
+      n)
+        if [ "$show_line_numbers" = "on" ]; then
+          show_line_numbers="off"
+        else
+          show_line_numbers="on"
+        fi
+        force_render=1
+        ;;
+      /)
+        if prompt_sed_filter; then
+          force_render=1
+        fi
+        ;;
+      c)
+        sed_filter=""
+        force_render=1
+        ;;
+      +|=)
+        context_lines=$((context_lines + 1))
+        force_render=1
+        ;;
+      -)
+        if [ "$context_lines" -gt 0 ]; then
+          context_lines=$((context_lines - 1))
+        fi
+        force_render=1
+        ;;
+      f|d)
+        if [ "$mode" = "status" ]; then
+          mode="$last_diff_mode"
+        else
+          last_diff_mode="$mode"
+          mode="status"
+        fi
+        force_render=1
+        ;;
+      l)
+        launch_lazygit
+        force_render=1
+        ;;
+    esac
+  fi
+
+  signature="$(make_signature)"
+  if [ "$signature" != "$last_signature" ] || [ "$force_render" -eq 1 ]; then
+    render
+    last_signature="$signature"
+  fi
+done
