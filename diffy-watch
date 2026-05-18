@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
@@ -37,6 +37,9 @@ context_lines="3"
 interval="2"
 directory="."
 diff_args=()
+temp_index=""
+crash_line=""
+crash_command=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -78,12 +81,58 @@ fi
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+temp_index="$(mktemp "${TMPDIR:-/tmp}/diffy-watch-index.XXXXXX")"
+
+cleanup() {
+  rm -f "$temp_index"
+}
+
+on_exit() {
+  local exit_code="$1"
+
+  cleanup
+  restore_tmux_focus
+
+  if [ "$exit_code" -ne 0 ] && [ -n "$crash_command" ]; then
+    printf 'diffy-watch: exited %s at line %s: %s\n' \
+      "$exit_code" "$crash_line" "$crash_command" >&2
+  fi
+}
+
+on_error() {
+  crash_line="$1"
+  crash_command="$2"
+}
+
+trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
+trap 'on_exit "$?"' EXIT
+
+copy_index() {
+  local index_path
+
+  index_path="$(git rev-parse --git-path index)"
+  cp "$index_path" "$temp_index" 2>/dev/null || :
+}
+
+git_temp() {
+  GIT_INDEX_FILE="$temp_index" git "$@"
+}
+
+git_temp_diff() {
+  if [ "${#diff_args[@]}" -gt 0 ]; then
+    git_temp "$@" -- "${diff_args[@]}"
+  else
+    git_temp "$@"
+  fi
+}
+
 make_signature() {
-  git add -N . >/dev/null 2>&1 || true
+  copy_index
+  git_temp add -N . >/dev/null 2>&1 || true
   {
-    git status --porcelain=v1 -uall
-    git diff --staged --binary -- "${diff_args[@]}"
-    git diff --binary -- "${diff_args[@]}"
+    git_temp status --porcelain=v1 -uall
+    git_temp_diff diff --staged --binary --
+    git_temp_diff diff --binary --
   } | git hash-object --stdin
 }
 
@@ -162,7 +211,8 @@ build_filtered_paths() {
 }
 
 render() {
-  git add -N . >/dev/null 2>&1 || true
+  copy_index
+  git_temp add -N . >/dev/null 2>&1 || true
   build_filtered_paths
   context_args=(-U"$context_lines")
   delta_args=(
@@ -225,31 +275,31 @@ render() {
   section_header 15 39 "STATUS"
   if [ -n "$sed_filter" ]; then
     if [ "${#filtered_paths[@]}" -gt 0 ]; then
-      git status --short -uall -- "${filtered_paths[@]}"
+      git_temp status --short -uall -- "${filtered_paths[@]}"
     else
       printf '(no matching files)\n'
     fi
   else
-    git status --short -uall
+    git_temp status --short -uall
   fi
 
   if [ "$mode" != "status" ]; then
     section_header 15 28 "STAGED"
     if [ -n "$sed_filter" ]; then
       if [ "${#filtered_paths[@]}" -gt 0 ]; then
-        git --no-pager diff --color=always --staged "${context_args[@]}" -- "${filtered_paths[@]}" | delta "${delta_args[@]}"
+        git_temp --no-pager diff --color=always --staged "${context_args[@]}" -- "${filtered_paths[@]}" | delta "${delta_args[@]}"
       fi
     else
-      git --no-pager diff --color=always --staged "${context_args[@]}" -- "${diff_args[@]}" | delta "${delta_args[@]}"
+      git_temp_diff --no-pager diff --color=always --staged "${context_args[@]}" -- | delta "${delta_args[@]}"
     fi
 
     section_header 16 214 "UNSTAGED + UNTRACKED"
     if [ -n "$sed_filter" ]; then
       if [ "${#filtered_paths[@]}" -gt 0 ]; then
-        git --no-pager diff --color=always "${context_args[@]}" -- "${filtered_paths[@]}" | delta "${delta_args[@]}"
+        git_temp --no-pager diff --color=always "${context_args[@]}" -- "${filtered_paths[@]}" | delta "${delta_args[@]}"
       fi
     else
-      git --no-pager diff --color=always "${context_args[@]}" -- "${diff_args[@]}" | delta "${delta_args[@]}"
+      git_temp_diff --no-pager diff --color=always "${context_args[@]}" -- | delta "${delta_args[@]}"
     fi
   fi
 }
@@ -257,6 +307,18 @@ render() {
 launch_lazygit() {
   clear 2>/dev/null || printf '\033[H\033[2J'
   command lazygit
+}
+
+drain_escape_sequence() {
+  local byte=""
+
+  while IFS= read -rsn1 -t 0.01 byte; do
+    case "$byte" in
+      [A-Za-z~])
+        break
+        ;;
+    esac
+  done
 }
 
 restore_tmux_focus() {
@@ -300,6 +362,10 @@ while true; do
     restore_tmux_focus
   fi
   if IFS= read -rsn1 -t "$interval" key; then
+    if [ "$key" = $'\e' ]; then
+      drain_escape_sequence
+      continue
+    fi
     case "$key" in
       r)
         force_render=1
