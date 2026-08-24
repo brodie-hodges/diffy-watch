@@ -12,16 +12,20 @@ While running:
   r          manual refresh
   s          side by side diffs
   i          inline diffs
-  n          toggle line numbers
-  /          search files and diffs
-  c          clear search
+  n          toggle line numbers (next match while searching)
+  p          previous match while searching
+  /          search the current diffs
+  esc        exit search mode
   u          toggle untracked files
   a          toggle added files
   m          toggle modified files
   + / -      increase/decrease context lines
-  up / down  page selected diff backward/forward
+  up / down  scroll selected diff backward/forward
   j / k      select next/previous status row
   left/right select previous/next status row
+  space      scroll the status list
+  shift+space scroll the selected diff
+  mouse      select a status row or scroll diffs
   q          quit
   l          launch lazygit
 
@@ -36,6 +40,8 @@ EOF
 mode="inline"
 show_line_numbers="on"
 search_term=""
+search_active=0
+search_match_position=-1
 show_untracked="on"
 show_added="on"
 show_modified="on"
@@ -113,10 +119,15 @@ repo_operation="NORMAL"
 screen_lines=()
 screen_click_rows=()
 diff_lines=()
+search_match_lines=()
+search_match_offsets=()
 diff_viewport_top=0
 diff_page_size=1
 status_window_top=0
+status_window_manual=0
+status_page_size=1
 terminal_rows=24
+terminal_columns=80
 tui_active=0
 terminal_stty_state=""
 diff_dirty=1
@@ -163,12 +174,12 @@ enter_tui() {
     terminal_stty_state="$(stty -g 2>/dev/null)" || terminal_stty_state=""
     stty -echo 2>/dev/null || true
   fi
-  printf '\033[?1049h\033[?25l\033[?7l\033[?1000h\033[?1006h\033[2J\033[H'
+  printf '\033[?1049h\033[?25l\033[?7l\033[?1000h\033[?1006h\033[>4;1m\033[2J\033[H'
 }
 
 leave_tui() {
   if [ "$tui_active" -eq 1 ]; then
-    printf '\033[?1006l\033[?1000l\033[?7h\033[?25h\033[?1049l'
+    printf '\033[>4m\033[?1006l\033[?1000l\033[?7h\033[?25h\033[?1049l'
     if [ -n "$terminal_stty_state" ]; then
       stty "$terminal_stty_state" 2>/dev/null || true
       terminal_stty_state=""
@@ -206,6 +217,34 @@ terminal_row_count() {
   esac
   [ "$rows" -gt 0 ] || rows=24
   printf '%s\n' "$rows"
+}
+
+terminal_column_count() {
+  local columns=""
+  local size=""
+
+  if [ -t 0 ]; then
+    size="$(stty size 2>/dev/null)" || size=""
+    columns="${size#* }"
+    case "$columns" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$columns" -gt 0 ]; then
+          printf '%s\n' "$columns"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  columns="${COLUMNS:-}"
+  case "$columns" in
+    ''|*[!0-9]*) columns="$(tput cols 2>/dev/null || printf '80')" ;;
+  esac
+  case "$columns" in
+    ''|*[!0-9]*) columns=80 ;;
+  esac
+  [ "$columns" -gt 0 ] || columns=80
+  printf '%s\n' "$columns"
 }
 
 on_exit() {
@@ -314,36 +353,6 @@ count_conflicts() {
   printf '%s\n' "$conflict_count"
 }
 
-path_matches_search() {
-  local path="$1"
-
-  if [ -z "$search_term" ]; then
-    return 0
-  fi
-
-  case "$path" in
-    *"$search_term"*)
-      return 0
-      ;;
-  esac
-
-  if [ -f "$repo_root/$path" ] && grep -I -F -q -- "$search_term" "$repo_root/$path"; then
-    return 0
-  fi
-
-  if git_temp --no-pager diff --color=never --staged -- "$path" 2>/dev/null | \
-    grep -F -q -- "$search_term"; then
-    return 0
-  fi
-
-  if git_temp --no-pager diff --color=never -- "$path" 2>/dev/null | \
-    grep -F -q -- "$search_term"; then
-    return 0
-  fi
-
-  return 1
-}
-
 status_is_visible() {
   local status="$1"
 
@@ -369,10 +378,6 @@ append_file_if_new() {
   if ! status_is_visible "$status"; then
     return 0
   fi
-  if ! path_matches_search "$path"; then
-    return 0
-  fi
-
   file_paths+=("$path")
   file_statuses+=("$status")
   file_keys+=("$path")
@@ -470,6 +475,7 @@ move_file_selection() {
   else
     selected_key="${file_keys[$((selected_row - 1))]}"
   fi
+  status_window_manual=0
   diff_viewport_top=0
   diff_dirty=1
 }
@@ -510,6 +516,44 @@ key_hint() {
     "$key" "$label"
 }
 
+screen_append_hint_lines() {
+  local prefix="$1"
+  local prefix_width="$2"
+  local indent=""
+  local line="$prefix"
+  local line_width="$prefix_width"
+  local has_hint=0
+  local key=""
+  local label=""
+  local hint=""
+  local hint_width=0
+
+  shift 2
+  printf -v indent '%*s' "$prefix_width" ''
+  while [ "$#" -gt 0 ]; do
+    key="$1"
+    label="$2"
+    shift 2
+    hint="$(key_hint "$key" "$label")"
+    hint_width=$((${#key} + ${#label} + 3))
+    if [ "$has_hint" -eq 1 ] && \
+      [ $((line_width + hint_width + 2)) -gt "$terminal_columns" ]; then
+      screen_lines+=("$line")
+      line="$indent"
+      line_width="$prefix_width"
+      has_hint=0
+    fi
+    if [ "$has_hint" -eq 1 ]; then
+      line="$line  "
+      line_width=$((line_width + 2))
+    fi
+    line="$line$hint"
+    line_width=$((line_width + hint_width))
+    has_hint=1
+  done
+  screen_lines+=("$line")
+}
+
 diff_append_multiline() {
   local output="$1"
   local line=""
@@ -530,12 +574,30 @@ screen_append_section() {
 }
 
 screen_append_status_section() {
+  screen_append_hint_lines "$(pill 15 39 'STATUS')  " 12 \
+    'u' "?? $show_untracked" \
+    'a' "A $show_added" \
+    'm' "M $show_modified" \
+    '→' 'next file' \
+    '←' 'prev file' \
+    'space' 'more'
+}
+
+screen_append_more_row() {
+  screen_click_rows+=("${#screen_lines[@]}:more")
+  screen_lines+=($'\033[38;5;244m--more--\033[0m')
+}
+
+screen_append_diffs_section() {
   local header=""
 
-  header="$(pill 15 39 "STATUS")  $(key_hint 'u' "?? $show_untracked")"
-  header="$header  $(key_hint 'a' "A $show_added")"
-  header="$header  $(key_hint 'm' "M $show_modified")"
-  screen_lines+=("")
+  header="$(pill 15 28 'DIFFS')  $(key_hint '↑/↓' 'scroll')"
+  header="$header  $(key_hint 'mouse' 'scroll')"
+  header="$header  $(key_hint 'shift+space' 'more')"
+  if [ "$search_active" -eq 1 ]; then
+    header="$header  $(key_hint 'p/n' 'match')"
+    header="$header  $(key_hint 'esc' 'exit search')"
+  fi
   screen_lines+=("$header")
 }
 
@@ -587,8 +649,7 @@ render_diff_text() {
       git_temp --no-pager diff --color=always "${context_args[@]}" -- "$path" 2>/dev/null | \
         delta "${delta_args[@]}" || true
     fi
-  elif [ "${#file_paths[@]}" -gt 0 ] && \
-    { [ -n "$search_term" ] || status_filters_active; }; then
+  elif [ "${#file_paths[@]}" -gt 0 ] && status_filters_active; then
     if [ "$kind" = "staged" ]; then
       git_temp --no-pager diff --color=always --staged "${context_args[@]}" -- "${file_paths[@]}" 2>/dev/null | \
         delta "${delta_args[@]}" || true
@@ -659,19 +720,117 @@ refresh_diff_lines() {
   fi
   [ "${#diff_lines[@]}" -gt 0 ] || diff_lines+=("(no diff output)")
   diff_dirty=0
+  if [ "$search_active" -eq 1 ]; then
+    rebuild_diff_search
+  fi
+}
+
+rebuild_diff_search() {
+  local match_line=0
+  local match_offset=0
+
+  search_match_lines=()
+  search_match_offsets=()
+  if [ "$search_active" -eq 0 ] || [ -z "$search_term" ]; then
+    search_match_position=-1
+    return 0
+  fi
+  while IFS=$'\t' read -r match_line match_offset; do
+    search_match_lines+=("$match_line")
+    search_match_offsets+=("$match_offset")
+  done < <(printf '%s\n' "${diff_lines[@]}" | DIFFY_SEARCH_TERM="$search_term" perl -ne '
+    s/\e\[[0-9;?]*[ -\/]*[@-~]//g;
+    my $term = $ENV{DIFFY_SEARCH_TERM};
+    my $offset = 0;
+    while (length($term) && ($offset = index($_, $term, $offset)) >= 0) {
+      print(($. - 1) . "\t$offset\n");
+      $offset += length($term);
+    }
+  ')
+
+  if [ "${#search_match_lines[@]}" -eq 0 ]; then
+    search_match_position=-1
+    diff_viewport_top=0
+  else
+    [ "$search_match_position" -ge 0 ] || search_match_position=0
+    if [ "$search_match_position" -ge "${#search_match_lines[@]}" ]; then
+      search_match_position=$((${#search_match_lines[@]} - 1))
+    fi
+    diff_viewport_top="${search_match_lines[$search_match_position]}"
+  fi
+}
+
+diff_line_is_search_match() {
+  local line_number="$1"
+  local match_line=0
+
+  for match_line in "${search_match_lines[@]}"; do
+    [ "$match_line" -eq "$line_number" ] && return 0
+  done
+  return 1
+}
+
+highlight_diff_search_matches() {
+  local line="$1"
+  local current_offset="$2"
+
+  printf '%s' "$line" | DIFFY_SEARCH_TERM="$search_term" DIFFY_SEARCH_OFFSET="$current_offset" perl -pe '
+    my $term = $ENV{DIFFY_SEARCH_TERM};
+    my $current = $ENV{DIFFY_SEARCH_OFFSET};
+    my $plain = $_;
+    $plain =~ s/\e\[[0-9;?]*[ -\/]*[@-~]//g;
+    my (%starts, %ends, %current_starts);
+    my $offset = 0;
+    while (length($term) && ($offset = index($plain, $term, $offset)) >= 0) {
+      $starts{$offset} = 1;
+      $current_starts{$offset} = 1 if $offset == $current;
+      $offset += length($term);
+      $ends{$offset} = 1;
+    }
+    my ($visible, $highlighted, $current_highlight, $output) = (0, 0, 0, q{});
+    while (length($_)) {
+      if (s/^(\e\[[0-9;?]*[ -\/]*[@-~])//) {
+        $output .= $1;
+        next;
+      }
+      s/^(.)//s;
+      if ($starts{$visible} && !$highlighted) {
+        $current_highlight = $current_starts{$visible} ? 1 : 0;
+        $output .= $current_highlight ? "\e[7;1m" : "\e[7m";
+        $highlighted = 1;
+      }
+      $output .= $1;
+      $visible++;
+      if ($ends{$visible} && $highlighted) {
+        $output .= $current_highlight ? "\e[27;22m" : "\e[27m";
+        $highlighted = 0;
+        $current_highlight = 0;
+      }
+    }
+    $_ = $output;
+  '
 }
 
 draw_screen() {
   local pinned_count="${#screen_lines[@]}"
   local diff_height=$((terminal_rows - pinned_count))
+  local diff_content_height=0
+  local diff_overflow=0
+  local diff_line_number=0
+  local current_search_offset=-1
   local max_viewport=0
   local screen_row=0
   local line=""
 
   [ "$diff_height" -gt 0 ] || diff_height=1
-  diff_page_size="$diff_height"
-  if [ "${#diff_lines[@]}" -gt "$diff_height" ]; then
-    max_viewport=$((${#diff_lines[@]} - diff_height))
+  diff_content_height="$diff_height"
+  if [ "$diff_height" -gt 1 ] && [ "${#diff_lines[@]}" -gt "$diff_height" ]; then
+    diff_overflow=1
+    diff_content_height=$((diff_height - 1))
+  fi
+  diff_page_size="$diff_content_height"
+  if [ "${#diff_lines[@]}" -gt "$diff_content_height" ]; then
+    max_viewport=$((${#diff_lines[@]} - diff_content_height))
   fi
   if [ "$diff_viewport_top" -lt 0 ]; then
     diff_viewport_top=0
@@ -685,8 +844,20 @@ draw_screen() {
     if [ "$screen_row" -lt "$pinned_count" ]; then
       line="${screen_lines[$screen_row]}"
       printf '\033[%s;1H%s\033[K' "$((screen_row + 1))" "$line"
+    elif [ "$diff_overflow" -eq 1 ] && [ "$screen_row" -eq $((terminal_rows - 1)) ]; then
+      printf '\033[%s;1H\033[48;5;234m\033[38;5;244m--more--\033[0;48;5;234m\033[K\033[0m' \
+        "$((screen_row + 1))"
     elif [ $((diff_viewport_top + screen_row - pinned_count)) -lt "${#diff_lines[@]}" ]; then
-      line="${diff_lines[$((diff_viewport_top + screen_row - pinned_count))]}"
+      diff_line_number=$((diff_viewport_top + screen_row - pinned_count))
+      line="${diff_lines[$diff_line_number]}"
+      if [ "$search_active" -eq 1 ] && diff_line_is_search_match "$diff_line_number"; then
+        current_search_offset=-1
+        if [ "$search_match_position" -ge 0 ] && \
+          [ "${search_match_lines[$search_match_position]}" -eq "$diff_line_number" ]; then
+          current_search_offset="${search_match_offsets[$search_match_position]}"
+        fi
+        line="$(highlight_diff_search_matches "$line" "$current_search_offset")"
+      fi
       printf '\033[%s;1H\033[48;5;234m%s\033[0;48;5;234m\033[K\033[0m' \
         "$((screen_row + 1))" "$line"
     else
@@ -701,11 +872,15 @@ render() {
   local file_capacity=0
   local file_end=0
   local max_window_top=0
-  local status_capacity=0
-  local controls=""
+  local status_available=0
+  local status_item_capacity=0
+  local show_all_row=0
+  local status_truncated=0
+  local upper_height=0
   local title_line=""
 
   terminal_rows="$(terminal_row_count)"
+  terminal_columns="$(terminal_column_count)"
   context_args=(-U"$context_lines")
   delta_args=(
     --paging=never
@@ -731,46 +906,48 @@ render() {
   esac
 
   title_line="$(pill 15 39 ' 👀 diffy-watch')  $(pill 15 60 "$mode_label")"
+  title_line="$title_line  "$'\033[38;5;244mContext\033[0m  \033[38;5;255m'"$context_lines lines"$'\033[0m'
+  if [ "$search_active" -eq 1 ]; then
+    title_line="$title_line  "$'\033[38;5;244mSearch\033[0m  \033[38;5;255m'"$search_term"$'\033[0m'
+  fi
+  title_line="$title_line  "$'\033[38;5;244mOperation\033[0m  '"$repo_operation"
   title_line="$title_line  $(printf '\033[38;5;111m%s\033[0m  \033[38;5;246m%s\033[0m' "$(date '+%Y-%m-%d %H:%M:%S')" "$repo_root")"
   screen_lines+=("$title_line")
-  controls="$(
-    printf '\033[38;5;244mControls\033[0m  '
-    key_hint 'r' 'refresh'
-    printf '  '
-    key_hint 's/i' 'diff mode'
-    printf '  '
-    key_hint 'n' 'line nums'
-    printf '  '
-    key_hint '/' 'search'
-    printf '  '
-    key_hint '+/-' 'context'
-    printf '  '
-    key_hint '↑/↓' 'page diff'
-    printf '  '
-    key_hint '←/→' 'select'
-    printf '  '
-    key_hint 'mouse' 'select/scroll'
-    printf '  '
-    key_hint 'q' 'quit'
-    printf '  '
-    key_hint 'l' 'lazygit'
-  )"
-  screen_lines+=("$controls")
-  screen_lines+=($'\033[38;5;244mContext\033[0m   \033[38;5;255m'"$context_lines lines"$'\033[0m')
-  if [ -n "$search_term" ]; then
-    screen_lines+=($'\033[38;5;244mSearch\033[0m    \033[38;5;255m'"$search_term"$'\033[0m')
-  fi
-  screen_lines+=($'\033[38;5;244mOperation\033[0m  '"$repo_operation")
+  screen_append_hint_lines $'\033[38;5;244mControls\033[0m  ' 10 \
+    'r' 'refresh' \
+    's/i' 'diff mode' \
+    'n' 'line nums' \
+    '/' 'search' \
+    '+/-' 'context' \
+    'q' 'quit' \
+    'l' 'lazygit'
   if [ -n "$repo_error" ]; then
     screen_lines+=($'\033[38;5;196mGit error\033[0m   '"$repo_error")
   fi
 
+  upper_height=$((terminal_rows / 3))
+  [ "$upper_height" -ge 1 ] || upper_height=1
   screen_append_status_section
-  screen_append_status_row 0 "  " "All diffs"
-  status_capacity=$((terminal_rows / 3))
-  [ "$status_capacity" -ge 2 ] || status_capacity=2
-  file_capacity=$((status_capacity - 1))
-  if [ "$selected_row" -gt 0 ]; then
+  status_available=$((upper_height - ${#screen_lines[@]}))
+  [ "$status_available" -ge 0 ] || status_available=0
+  if [ $(( ${#file_paths[@]} + 1 )) -gt "$status_available" ]; then
+    status_truncated=1
+  fi
+  status_item_capacity=$((status_available - status_truncated))
+  [ "$status_item_capacity" -ge 0 ] || status_item_capacity=0
+  if [ "$status_item_capacity" -gt 0 ]; then
+    show_all_row=1
+    if [ "$status_item_capacity" -eq 1 ] && [ "$selected_row" -gt 0 ]; then
+      show_all_row=0
+    fi
+  fi
+  file_capacity=$((status_item_capacity - show_all_row))
+  status_page_size="$file_capacity"
+  [ "$status_page_size" -gt 0 ] || status_page_size=1
+  if [ "$show_all_row" -eq 1 ]; then
+    screen_append_status_row 0 "  " "All diffs"
+  fi
+  if [ "$selected_row" -gt 0 ] && [ "$status_window_manual" -eq 0 ]; then
     file_index=$((selected_row - 1))
     if [ "$file_index" -lt "$status_window_top" ]; then
       status_window_top="$file_index"
@@ -786,9 +963,16 @@ render() {
   for ((file_index = status_window_top; file_index < file_end; file_index++)); do
     screen_append_status_row "$((file_index + 1))" "${file_statuses[$file_index]}" "${file_paths[$file_index]}"
   done
+  if [ "$status_truncated" -eq 1 ]; then
+    screen_append_more_row
+  fi
+  while [ "${#screen_lines[@]}" -lt "$upper_height" ]; do
+    screen_lines+=("")
+  done
 
   refresh_diff_lines
-  screen_append_section 15 28 "DIFFS"
+  screen_lines+=("")
+  screen_append_diffs_section
   draw_screen
 }
 
@@ -808,6 +992,18 @@ launch_lazygit() {
   diff_dirty=1
 }
 
+scroll_status_next() {
+  local file_count="${#file_paths[@]}"
+
+  [ "$file_count" -gt 0 ] || return 0
+  status_window_top=$((status_window_top + status_page_size))
+  if [ "$status_window_top" -ge "$file_count" ]; then
+    status_window_top=0
+  fi
+  status_window_manual=1
+  force_render=1
+}
+
 select_status_at_row() {
   local mouse_y="$1"
   local logical_row=$((mouse_y - 1))
@@ -820,7 +1016,12 @@ select_status_at_row() {
       entry_row="${entry%%:*}"
       row_index="${entry#*:}"
       if [ "$entry_row" -eq "$logical_row" ]; then
+        if [ "$row_index" = "more" ]; then
+          scroll_status_next
+          return 0
+        fi
         selected_row="$row_index"
+        status_window_manual=0
         if [ "$selected_row" -eq 0 ]; then
           selected_key="__all__"
           status_window_top=0
@@ -902,9 +1103,20 @@ handle_mouse_event() {
 consume_escape_sequence() {
   local byte=""
   local payload=""
+  local sequence=""
 
-  IFS= read -rsn1 -t 1 byte || return 0
-  [ "$byte" = "[" ] || return 0
+  if ! IFS= read -rsn1 -t 1 byte; then
+    if [ "$search_active" -eq 1 ]; then
+      exit_diff_search
+    fi
+    return 0
+  fi
+  if [ "$byte" != "[" ]; then
+    if [ "$search_active" -eq 1 ]; then
+      exit_diff_search
+    fi
+    return 0
+  fi
   IFS= read -rsn1 -t 1 byte || return 0
   if [ "$byte" = "<" ]; then
     while IFS= read -rsn1 -t 1 byte; do
@@ -940,13 +1152,20 @@ consume_escape_sequence() {
       ;;
   esac
 
+  sequence="$byte"
   while :; do
     case "$byte" in
       [A-Za-z~])
+        case "$sequence" in
+          '32;2u'|'27;2;32~')
+            page_diff next
+            ;;
+        esac
         return 0
         ;;
     esac
     IFS= read -rsn1 -t 1 byte || return 0
+    sequence="$sequence$byte"
   done
 }
 
@@ -958,7 +1177,7 @@ prompt_search() {
   if [ -n "$terminal_stty_state" ]; then
     stty "$terminal_stty_state" 2>/dev/null || true
   fi
-  printf '\033[?25h\033[%s;1H\033[2Ksearch (blank clears): ' "$rows"
+  printf '\033[?25h\033[%s;1H\033[2Ksearch: ' "$rows"
   if ! IFS= read -r input; then
     if [ -n "$terminal_stty_state" ]; then
       stty -echo 2>/dev/null || true
@@ -971,6 +1190,38 @@ prompt_search() {
   fi
   printf '\033[?25l'
   search_term="$input"
+  if [ -n "$search_term" ]; then
+    search_active=1
+    search_match_position=-1
+    rebuild_diff_search
+  else
+    exit_diff_search
+  fi
+}
+
+navigate_diff_search() {
+  local direction="$1"
+  local match_count="${#search_match_lines[@]}"
+
+  [ "$match_count" -gt 0 ] || return 0
+  if [ "$direction" = "next" ]; then
+    search_match_position=$((search_match_position + 1))
+    [ "$search_match_position" -lt "$match_count" ] || search_match_position=0
+  else
+    search_match_position=$((search_match_position - 1))
+    [ "$search_match_position" -ge 0 ] || search_match_position=$((match_count - 1))
+  fi
+  diff_viewport_top="${search_match_lines[$search_match_position]}"
+  force_render=1
+}
+
+exit_diff_search() {
+  search_active=0
+  search_term=""
+  search_match_lines=()
+  search_match_offsets=()
+  search_match_position=-1
+  force_render=1
 }
 
 compute_repo_signature() {
@@ -1063,29 +1314,31 @@ while true; do
         force_render=1
         ;;
       n)
-        if [ "$show_line_numbers" = "on" ]; then
-          show_line_numbers="off"
+        if [ "$search_active" -eq 1 ]; then
+          navigate_diff_search next
         else
-          show_line_numbers="on"
-        fi
-        diff_viewport_top=0
-        diff_dirty=1
-        force_render=1
-        ;;
-      /)
-        if prompt_search; then
-          refresh_file_index
+          if [ "$show_line_numbers" = "on" ]; then
+            show_line_numbers="off"
+          else
+            show_line_numbers="on"
+          fi
           diff_viewport_top=0
           diff_dirty=1
           force_render=1
         fi
         ;;
+      p)
+        if [ "$search_active" -eq 1 ]; then
+          navigate_diff_search previous
+        fi
+        ;;
+      /)
+        if prompt_search; then
+          force_render=1
+        fi
+        ;;
       c)
-        search_term=""
-        refresh_file_index
-        diff_viewport_top=0
-        diff_dirty=1
-        force_render=1
+        exit_diff_search
         ;;
       u)
         toggle_status_filter untracked
@@ -1120,6 +1373,11 @@ while true; do
       k)
         move_file_selection previous
         force_render=1
+        ;;
+      ' ')
+        if [ "${#file_paths[@]}" -gt "$status_page_size" ]; then
+          scroll_status_next
+        fi
         ;;
       l)
         launch_lazygit

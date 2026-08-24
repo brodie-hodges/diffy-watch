@@ -107,8 +107,12 @@ if [[ "$single_screen" != *"STATUS"*"All diffs"*"?? alpha.txt"*"?? beta.txt"*"DI
   echo "single-repository rendering failed" >&2
   exit 1
 fi
-if [[ "$single_screen" != *"[u] ?? on"*"[a] A on"*"[m] M on"* ]]; then
+if [[ "$single_screen" != *"[u] ?? on"*"[a] A on"*"[m] M on"*"[→] next file"*"[←] prev file"*"[space] more"* ]]; then
   echo "status filter hints were not rendered" >&2
+  exit 1
+fi
+if [[ "$single_screen" != *"DIFFS"*"[↑/↓] scroll"*"[mouse] scroll"*"[shift+space] more"* ]]; then
+  echo "diff scroll hints were not rendered" >&2
   exit 1
 fi
 if ! grep -Fq $'\033[38;5;196malpha.txt' "$single_output"; then
@@ -146,11 +150,51 @@ stop_watch "$watch_pid"
 exec 3>&-
 rm -f "$fixture_root/input"
 
+search_repo="$fixture_root/search-repo"
+make_repo "$search_repo"
+for line_number in {1..40}; do
+  printf 'base-%02d\n' "$line_number" >> "$search_repo/search.txt"
+done
+git -C "$search_repo" add search.txt
+git -C "$search_repo" commit -q -m base
+perl -pi -e 's/base-02/SEARCH-NEEDLE/; s/base-35/SEARCH-NEEDLE/' "$search_repo/search.txt"
+
 search_output="$fixture_root/search-output"
-run_watch "$search_output" "$repo"
-printf '/beta\n' >&3
-if ! wait_for_screen_pattern "$search_output" "Search.*beta"; then
-  echo "slash search control failed" >&2
+COLUMNS=120 LINES=18 run_watch "$search_output" "$search_repo"
+printf '\033[C' >&3
+wait_for_screen_pattern "$search_output" '>  M search.txt'
+printf '/SEARCH-NEEDLE\n' >&3
+if ! wait_for_screen_pattern "$search_output" 'Search.*SEARCH-NEEDLE'; then
+  echo "slash search mode did not activate" >&2
+  exit 1
+fi
+if ! grep -Fq $'\033[7;1mSEARCH-NEEDLE\033[27;22m' "$search_output"; then
+  echo "diff search match was not highlighted" >&2
+  exit 1
+fi
+search_first_match="$(stable_last_screen "$search_output")"
+printf 'n' >&3
+sleep 0.1
+search_next_match="$(stable_last_screen "$search_output")"
+if [ "$search_first_match" = "$search_next_match" ]; then
+  echo "n did not navigate to the next diff search match" >&2
+  exit 1
+fi
+printf 'p' >&3
+sleep 0.1
+if [ "$(stable_last_screen "$search_output")" != "$search_first_match" ]; then
+  echo "p did not navigate to the previous diff search match" >&2
+  exit 1
+fi
+printf '\033' >&3
+if ! wait_for_screen_pattern "$search_output" 'Operation'; then
+  echo "diff search did not redraw after escape" >&2
+  exit 1
+fi
+sleep 1.1
+search_escaped="$(plain_last_screen "$search_output")"
+if [[ "$search_escaped" == *"Search  SEARCH-NEEDLE"* ]]; then
+  echo "escape did not exit diff search mode" >&2
   exit 1
 fi
 stop_watch "$watch_pid"
@@ -289,15 +333,42 @@ for file_number in {1..12}; do
   printf 'change-%s\n' "$file_number" > "$capped_repo/file$file_number.txt"
 done
 capped_output="$fixture_root/capped-output"
-LINES=18 run_watch "$capped_output" "$capped_repo"
+COLUMNS=80 LINES=24 run_watch "$capped_output" "$capped_repo"
 for move in {1..10}; do
   printf '\033[C' >&3
 done
 wait_for_screen_pattern "$capped_output" '> ??'
 capped_screen="$(plain_last_screen "$capped_output")"
-if [[ "$capped_screen" != *"All diffs"*"DIFFS"* ]] || \
-  [ "$(printf '%s' "$capped_screen" | grep -c '?? file')" -gt 5 ]; then
+if [[ "$capped_screen" != *"All diffs"*"--more--"*"DIFFS"* ]] || \
+  [ "$(printf '%s' "$capped_screen" | grep -c '?? file')" -gt 1 ]; then
   echo "pinned capped status list failed" >&2
+  exit 1
+fi
+more_row="$(last_screen "$capped_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/--more--/ && /^(\d+) /) { print $1; exit } }')"
+diffs_row="$(last_screen "$capped_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/DIFFS/ && /^(\d+) /) { print $1; exit } }')"
+wrapped_rows="$(last_screen "$capped_output" | perl -0pe 's/\e\[\d+;1H/\n/g; s/\e\[[0-9;?]*[ -\/]*[@-~]//g')"
+if [ "$more_row" -ne 8 ] || [ "$diffs_row" -ne 10 ]; then
+  echo "header and status did not use one third of the terminal" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$wrapped_rows" | grep -Eq '^ {10}\[q\] quit' || \
+  ! printf '%s\n' "$wrapped_rows" | grep -Eq '^ {12}\[space\] more'; then
+  echo "wrapped hints were not aligned with the first hint" >&2
+  exit 1
+fi
+capped_before_more="$(stable_last_screen "$capped_output")"
+printf '\033[<0;1;%sM' "$more_row" >&3
+printf '\033[<0;1;%sm' "$more_row" >&3
+sleep 0.1
+if [ "$(stable_last_screen "$capped_output")" = "$capped_before_more" ]; then
+  echo "clicking more did not scroll the status list" >&2
+  exit 1
+fi
+capped_before_space="$(stable_last_screen "$capped_output")"
+printf ' ' >&3
+sleep 0.1
+if [ "$(stable_last_screen "$capped_output")" = "$capped_before_space" ]; then
+  echo "space did not scroll the status list" >&2
   exit 1
 fi
 stop_watch "$watch_pid"
@@ -316,10 +387,28 @@ for line_number in {1..60}; do
 done
 mv "$paging_repo/changed.txt" "$paging_repo/long.txt"
 paging_output="$fixture_root/paging-output"
-LINES=18 run_watch "$paging_output" "$paging_repo"
+COLUMNS=200 LINES=18 run_watch "$paging_output" "$paging_repo"
 printf '\033[C' >&3
 wait_for_screen_pattern "$paging_output" '>  M long.txt'
 paging_before="$(stable_last_screen "$paging_output")"
+paging_more_row="$(last_screen "$paging_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/--more--/ && /^(\d+) /) { print $1; exit } }')"
+if [ "$paging_more_row" -ne 18 ]; then
+  echo "overflowing diff did not render more at the bottom" >&2
+  exit 1
+fi
+printf '\033[32;2u' >&3
+sleep 0.1
+paging_shift_space="$(stable_last_screen "$paging_output")"
+if [ "$paging_before" = "$paging_shift_space" ]; then
+  echo "shift-space did not page the selected diff" >&2
+  exit 1
+fi
+printf '\033[A' >&3
+sleep 0.1
+if [ "$(stable_last_screen "$paging_output")" != "$paging_before" ]; then
+  echo "up-arrow did not restore the diff after shift-space paging" >&2
+  exit 1
+fi
 printf '\033[B' >&3
 sleep 0.1
 paging_after="$(stable_last_screen "$paging_output")"
