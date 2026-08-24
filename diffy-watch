@@ -3,43 +3,48 @@ set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: diffy-watch [sbs] [-n SECONDS] [-d DIRECTORY ...] [-- DIFF_ARGS...]
+Usage: diffy-watch [sbs] [-n SECONDS] [DIRECTORY] [-- DIFF_ARGS...]
 
-Refreshes a tmux-friendly diff view for one or more Git worktrees.
+Refreshes a tmux-friendly diff view when staged, unstaged, or untracked
+changes in a Git worktree change.
 
 While running:
   r          manual refresh
   s          side by side diffs
   i          inline diffs
   n          toggle line numbers
-  /          set file filter
-  c          clear file filter
+  /          search files and diffs
+  c          clear search
+  u          toggle untracked files
+  a          toggle added files
+  m          toggle modified files
   + / -      increase/decrease context lines
-  f / d      files/status only
-  j / k      next/previous changed file
-  space      collapse/expand selected file diff
-  E          expand all file diffs
-  C          collapse all file diffs
-  [ / ]      previous/next repository
-  l          launch lazygit for the active repository
+  up / down  page selected diff backward/forward
+  j / k      select next/previous status row
+  left/right select previous/next status row
+  q          quit
+  l          launch lazygit
 
 Examples:
   diffy-watch
   diffy-watch sbs
-  diffy-watch -n 1 -d ~/Workspace/project-a -d ~/Workspace/project-b
-  diffy-watch -d . -- packages/foo/src/file.ts
+  diffy-watch -n 1 ~/Workspace/project
+  diffy-watch sbs . -- packages/foo/src/file.ts
 EOF
 }
 
 mode="inline"
-last_diff_mode="inline"
 show_line_numbers="on"
-file_filter=""
+search_term=""
+show_untracked="on"
+show_added="on"
+show_modified="on"
 context_lines="3"
 interval="2"
+directory="."
+directory_set=0
 diff_args=()
 diff_args_present=0
-requested_directories=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -53,14 +58,6 @@ while [ "$#" -gt 0 ]; do
         echo "diffy-watch: interval must be a whole number of seconds" >&2
         exit 2
       fi
-      shift 2
-      ;;
-    -d|--directory)
-      if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
-        echo "diffy-watch: missing directory value" >&2
-        exit 2
-      fi
-      requested_directories+=("$2")
       shift 2
       ;;
     -h|--help)
@@ -79,118 +76,104 @@ while [ "$#" -gt 0 ]; do
       exit 2
       ;;
     *)
-      requested_directories+=("$1")
+      if [ "$directory_set" -eq 1 ]; then
+        echo "diffy-watch: only one directory can be watched per instance" >&2
+        exit 2
+      fi
+      directory="$1"
+      directory_set=1
       shift
       ;;
   esac
 done
 
-if [ "${#requested_directories[@]}" -eq 0 ]; then
-  requested_directories=(".")
+cd "$directory"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "diffy-watch: not inside a Git worktree: $directory" >&2
+  exit 1
 fi
 
-repo_roots=()
-repo_temp_dirs=()
-repo_temp_indexes=()
-repo_statuses=()
-repo_errors=()
-repo_operations=()
-active_repo=0
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/diffy-watch.XXXXXX")"
+temp_index="$temp_dir/index"
+crash_line=""
+crash_command=""
 
 file_paths=()
-file_repos=()
+file_statuses=()
 file_keys=()
-selected_file=0
-selected_file_key=""
-collapsed_keys=()
+selected_row=0
+selected_key="__all__"
+repo_status_text=""
+repo_error=""
+repo_operation="NORMAL"
+screen_lines=()
+screen_click_rows=()
+diff_lines=()
+diff_viewport_top=0
+diff_page_size=1
+status_window_top=0
+terminal_rows=24
+tui_active=0
+terminal_stty_state=""
+diff_dirty=1
 
-repo_git() {
-  local repo_index="$1"
-  shift
-  GIT_INDEX_FILE="${repo_temp_indexes[$repo_index]}" \
-    git -C "${repo_roots[$repo_index]}" "$@"
+git_temp() {
+  GIT_INDEX_FILE="$temp_index" git "$@"
 }
 
-repo_status() {
-  local repo_index="$1"
+git_path() {
+  local path=""
 
-  if [ "$diff_args_present" -eq 1 ] && [ "${#diff_args[@]}" -gt 0 ]; then
-    repo_git "$repo_index" status --short -uall -- "${diff_args[@]}"
-  else
-    repo_git "$repo_index" status --short -uall
-  fi
-}
-
-repo_diff_all() {
-  local repo_index="$1"
-  shift
-
-  if [ "$diff_args_present" -eq 1 ] && [ "${#diff_args[@]}" -gt 0 ]; then
-    repo_git "$repo_index" "$@" -- "${diff_args[@]}"
-  else
-    repo_git "$repo_index" "$@"
-  fi
-}
-
-git_path_for_repo() {
-  local repo_index="$1"
-  local git_path=""
-
-  git_path="$(git -C "${repo_roots[$repo_index]}" rev-parse --git-path "$2" 2>/dev/null)" || return 1
-  case "$git_path" in
+  path="$(git rev-parse --git-path "$1" 2>/dev/null)" || return 1
+  case "$path" in
     /*)
-      printf '%s\n' "$git_path"
+      printf '%s\n' "$path"
       ;;
     *)
-      printf '%s/%s\n' "${repo_roots[$repo_index]}" "$git_path"
+      printf '%s/%s\n' "$repo_root" "$path"
       ;;
   esac
 }
 
-register_repo() {
-  local requested="$1"
-  local root=""
-  local existing=""
-  local temp_dir=""
+copy_index() {
+  local index_path=""
 
-  if ! root="$(git -C "$requested" rev-parse --show-toplevel 2>/dev/null)"; then
-    echo "diffy-watch: not inside a Git worktree: $requested" >&2
-    return 0
+  index_path="$(git_path index)" || return 1
+  if [ -f "$index_path" ]; then
+    cp "$index_path" "$temp_index" 2>/dev/null
+  else
+    rm -f "$temp_index"
+    git_temp read-tree --empty >/dev/null 2>&1
   fi
-
-  if [ "${#repo_roots[@]}" -gt 0 ]; then
-    for existing in "${repo_roots[@]}"; do
-      if [ "$existing" = "$root" ]; then
-        return 0
-      fi
-    done
-  fi
-
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/diffy-watch.XXXXXX")"
-  repo_roots+=("$root")
-  repo_temp_dirs+=("$temp_dir")
-  repo_temp_indexes+=("$temp_dir/index")
-  repo_statuses+=("")
-  repo_errors+=("")
-  repo_operations+=("")
 }
 
-for requested_directory in "${requested_directories[@]}"; do
-  register_repo "$requested_directory"
-done
-
-if [ "${#repo_roots[@]}" -eq 0 ]; then
-  exit 1
-fi
-
 cleanup() {
-  local temp_dir=""
+  rm -f "$temp_index"
+  rmdir "$temp_dir" 2>/dev/null || true
+}
 
-  if [ "${#repo_temp_dirs[@]}" -gt 0 ]; then
-    for temp_dir in "${repo_temp_dirs[@]}"; do
-      rm -f "$temp_dir/index"
-      rmdir "$temp_dir" 2>/dev/null || true
-    done
+enter_tui() {
+  tui_active=1
+  terminal_stty_state=""
+  if [ -t 0 ]; then
+    terminal_stty_state="$(stty -g 2>/dev/null)" || terminal_stty_state=""
+    stty -echo 2>/dev/null || true
+  fi
+  printf '\033[?1049h\033[?25l\033[?7l\033[?1000h\033[?1006h\033[2J\033[H'
+}
+
+leave_tui() {
+  if [ "$tui_active" -eq 1 ]; then
+    printf '\033[?1006l\033[?1000l\033[?7h\033[?25h\033[?1049l'
+    if [ -n "$terminal_stty_state" ]; then
+      stty "$terminal_stty_state" 2>/dev/null || true
+      terminal_stty_state=""
+    fi
+    tui_active=0
   fi
 }
 
@@ -200,12 +183,35 @@ restore_tmux_focus() {
   fi
 }
 
-crash_line=""
-crash_command=""
+terminal_row_count() {
+  local size=""
+  local rows=""
+
+  if [ -t 0 ]; then
+    size="$(stty size 2>/dev/null)" || size=""
+    rows="${size%% *}"
+    case "$rows" in
+      ''|*[!0-9]*) ;;
+      *)
+        if [ "$rows" -gt 0 ]; then
+          printf '%s\n' "$rows"
+          return 0
+        fi
+        ;;
+    esac
+  fi
+  rows="$(tput lines 2>/dev/null || printf '24')"
+  case "$rows" in
+    ''|*[!0-9]*) rows=24 ;;
+  esac
+  [ "$rows" -gt 0 ] || rows=24
+  printf '%s\n' "$rows"
+}
 
 on_exit() {
   local exit_code="$1"
 
+  leave_tui
   cleanup
   restore_tmux_focus
 
@@ -223,55 +229,67 @@ on_error() {
 trap 'on_error "$LINENO" "$BASH_COMMAND"' ERR
 trap 'on_exit "$?"' EXIT
 
-copy_repo_index() {
-  local repo_index="$1"
-  local index_path=""
-
-  index_path="$(git_path_for_repo "$repo_index" index)" || return 1
-  if [ -f "$index_path" ]; then
-    cp "$index_path" "${repo_temp_indexes[$repo_index]}" 2>/dev/null
+repo_status() {
+  if [ "$diff_args_present" -eq 1 ] && [ "${#diff_args[@]}" -gt 0 ]; then
+    git_temp status --short -uall -- "${diff_args[@]}"
   else
-    rm -f "${repo_temp_indexes[$repo_index]}"
-    repo_git "$repo_index" read-tree --empty >/dev/null 2>&1
+    git_temp status --short -uall
   fi
 }
 
-repo_operation() {
-  local repo_index="$1"
-  local operation=""
+repo_status_actual() {
+  if [ "$diff_args_present" -eq 1 ] && [ "${#diff_args[@]}" -gt 0 ]; then
+    git status --short -uall -- "${diff_args[@]}"
+  else
+    git status --short -uall
+  fi
+}
+
+repo_diff() {
+  local diff_command="$1"
+  shift
+
+  if [ "$diff_args_present" -eq 1 ] && [ "${#diff_args[@]}" -gt 0 ]; then
+    git_temp "$diff_command" "$@" -- "${diff_args[@]}"
+  else
+    git_temp "$diff_command" "$@"
+  fi
+}
+
+detect_operation() {
   local operation_path=""
 
-  operation_path="$(git_path_for_repo "$repo_index" rebase-merge)" || operation_path=""
+  operation_path="$(git_path rebase-merge)" || operation_path=""
   if [ -d "$operation_path" ]; then
     printf 'REBASE (interactive)'
     return 0
   fi
 
-  operation_path="$(git_path_for_repo "$repo_index" rebase-apply)" || operation_path=""
+  operation_path="$(git_path rebase-apply)" || operation_path=""
   if [ -d "$operation_path" ]; then
     printf 'REBASE'
     return 0
   fi
 
-  operation_path="$(git_path_for_repo "$repo_index" MERGE_HEAD)" || operation_path=""
+  operation_path="$(git_path MERGE_HEAD)" || operation_path=""
   if [ -f "$operation_path" ]; then
     printf 'MERGE'
     return 0
   fi
 
-  operation_path="$(git_path_for_repo "$repo_index" CHERRY_PICK_HEAD)" || operation_path=""
+  operation_path="$(git_path CHERRY_PICK_HEAD)" || operation_path=""
   if [ -f "$operation_path" ]; then
     printf 'CHERRY-PICK'
     return 0
   fi
 
-  operation_path="$(git_path_for_repo "$repo_index" REVERT_HEAD)" || operation_path=""
+  operation_path="$(git_path REVERT_HEAD)" || operation_path=""
   if [ -f "$operation_path" ]; then
     printf 'REVERT'
     return 0
   fi
 
-  operation_path="$(git_path_for_repo "$repo_index" BISECT_HEAD)" || operation_path=""
+  operation_path="$(git_path BISECT_HEAD)" || operation_path=""
   if [ -f "$operation_path" ]; then
     printf 'BISECT'
     return 0
@@ -296,275 +314,183 @@ count_conflicts() {
   printf '%s\n' "$conflict_count"
 }
 
-refresh_repo_state() {
-  local repo_index="$1"
-  local status_text=""
-  local status_exit=0
-  local conflict_count=0
-  local operation=""
+path_matches_search() {
+  local path="$1"
 
-  repo_errors[$repo_index]=""
-  if ! copy_repo_index "$repo_index"; then
-    repo_errors[$repo_index]="unable to copy the Git index"
-    repo_statuses[$repo_index]=""
-    repo_operations[$repo_index]="$(repo_operation "$repo_index")"
-    return 0
-  fi
-
-  repo_git "$repo_index" add -N . >/dev/null 2>&1 || true
-  status_text="$(repo_status "$repo_index" 2>&1)" || status_exit=$?
-  repo_statuses[$repo_index]="$status_text"
-  operation="$(repo_operation "$repo_index")"
-  conflict_count="$(count_conflicts "$status_text")"
-
-  if [ "$status_exit" -ne 0 ]; then
-    repo_errors[$repo_index]="$status_text"
-  elif [ "$conflict_count" -gt 0 ]; then
-    repo_operations[$repo_index]="$operation, $conflict_count conflict(s)"
-  else
-    repo_operations[$repo_index]="$operation"
-  fi
-}
-
-file_key() {
-  printf '%s|%s' "${repo_roots[$1]}" "$2"
-}
-
-key_is_collapsed() {
-  local wanted="$1"
-  local key=""
-
-  if [ "${#collapsed_keys[@]}" -gt 0 ]; then
-    for key in "${collapsed_keys[@]}"; do
-      if [ "$key" = "$wanted" ]; then
-        return 0
-      fi
-    done
-  fi
-  return 1
-}
-
-path_matches_filter() {
-  local repo_index="$1"
-  local path="$2"
-
-  if [ -z "$file_filter" ]; then
+  if [ -z "$search_term" ]; then
     return 0
   fi
 
   case "$path" in
-    *"$file_filter"*)
+    *"$search_term"*)
       return 0
       ;;
   esac
 
-  if [ -f "${repo_roots[$repo_index]}/$path" ] && \
-    grep -I -F -q -- "$file_filter" "${repo_roots[$repo_index]}/$path"; then
+  if [ -f "$repo_root/$path" ] && grep -I -F -q -- "$search_term" "$repo_root/$path"; then
     return 0
   fi
 
-  if repo_git "$repo_index" --no-pager diff --color=never --staged -- "$path" 2>/dev/null | \
-    grep -F -q -- "$file_filter"; then
+  if git_temp --no-pager diff --color=never --staged -- "$path" 2>/dev/null | \
+    grep -F -q -- "$search_term"; then
     return 0
   fi
 
-  if repo_git "$repo_index" --no-pager diff --color=never -- "$path" 2>/dev/null | \
-    grep -F -q -- "$file_filter"; then
+  if git_temp --no-pager diff --color=never -- "$path" 2>/dev/null | \
+    grep -F -q -- "$search_term"; then
     return 0
   fi
 
   return 1
 }
 
-append_file_if_new() {
-  local repo_index="$1"
-  local path="$2"
-  local existing_repo=""
-  local existing_path=""
+status_is_visible() {
+  local status="$1"
 
-  if ! path_matches_filter "$repo_index" "$path"; then
+  if [ "$status" = "??" ]; then
+    [ "$show_untracked" = "on" ]
+  elif [ "${status:0:1}" = "A" ] || [ "${status:1:1}" = "A" ]; then
+    [ "$show_added" = "on" ]
+  else
+    [ "$show_modified" = "on" ]
+  fi
+}
+
+status_filters_active() {
+  [ "$show_untracked" != "on" ] || \
+    [ "$show_added" != "on" ] || \
+    [ "$show_modified" != "on" ]
+}
+
+append_file_if_new() {
+  local status="$1"
+  local path="$2"
+
+  if ! status_is_visible "$status"; then
     return 0
   fi
-
-  if [ "${#file_paths[@]}" -gt 0 ]; then
-    for existing_file_index in "${!file_paths[@]}"; do
-      existing_repo="${file_repos[$existing_file_index]}"
-      existing_path="${file_paths[$existing_file_index]}"
-      if [ "$existing_repo" -eq "$repo_index" ] && [ "$existing_path" = "$path" ]; then
-        return 0
-      fi
-    done
+  if ! path_matches_search "$path"; then
+    return 0
   fi
 
   file_paths+=("$path")
-  file_repos+=("$repo_index")
-  file_keys+=("$(file_key "$repo_index" "$path")")
+  file_statuses+=("$status")
+  file_keys+=("$path")
 }
 
 refresh_file_index() {
-  local previous_selected_key="$selected_file_key"
-  local repo_index=0
+  local previous_selected_key="$selected_key"
   local status_line=""
+  local status=""
   local path=""
-  local current_key=""
-  local collapsed_key=""
-  local found=0
 
   file_paths=()
-  file_repos=()
+  file_statuses=()
   file_keys=()
 
-  for repo_index in "${!repo_roots[@]}"; do
-    while IFS= read -r status_line; do
-      [ -n "$status_line" ] || continue
-      path="${status_line:3}"
-      case "$path" in
-        *' -> '*)
-          path="${path##* -> }"
-          ;;
-      esac
-      append_file_if_new "$repo_index" "$path"
-    done <<< "${repo_statuses[$repo_index]}"
-  done
+  while IFS= read -r status_line; do
+    [ -n "$status_line" ] || continue
+    status="${status_line:0:2}"
+    path="${status_line:3}"
+    case "$path" in
+      *' -> '* )
+        path="${path##* -> }"
+        ;;
+    esac
+    append_file_if_new "$status" "$path"
+  done <<< "$repo_status_text"
 
-  if [ "${#collapsed_keys[@]}" -gt 0 ]; then
-    for collapsed_key_index in "${!collapsed_keys[@]}"; do
-      collapsed_key="${collapsed_keys[$collapsed_key_index]}"
-      found=0
-      if [ "${#file_keys[@]}" -gt 0 ]; then
-        for current_key in "${file_keys[@]}"; do
-          if [ "$collapsed_key" = "$current_key" ]; then
-            found=1
-            break
-          fi
-        done
-      fi
-      if [ "$found" -eq 0 ]; then
-        unset 'collapsed_keys[$collapsed_key_index]'
-      fi
-    done
-  fi
-
-  if [ "${#file_keys[@]}" -eq 0 ]; then
-    selected_file=0
-    selected_file_key=""
+  selected_row=0
+  selected_key="__all__"
+  if [ "$previous_selected_key" = "__all__" ]; then
+    status_window_top=0
     return 0
   fi
-
-  selected_file=0
-  selected_file_key="${file_keys[0]}"
   for file_index in "${!file_keys[@]}"; do
     if [ "${file_keys[$file_index]}" = "$previous_selected_key" ]; then
-      selected_file="$file_index"
-      selected_file_key="$previous_selected_key"
+      selected_row=$((file_index + 1))
+      selected_key="$previous_selected_key"
       break
     fi
   done
+  [ "$selected_row" -gt 0 ] || status_window_top=0
 }
 
-prepare_state() {
-  local repo_index=0
+refresh_state() {
+  local status_exit=0
+  local conflict_count=0
+  local operation=""
 
-  for repo_index in "${!repo_roots[@]}"; do
-    refresh_repo_state "$repo_index"
-  done
-  refresh_file_index
-}
-
-set_active_repo_for_file() {
-  if [ "${#file_repos[@]}" -gt 0 ]; then
-    active_repo="${file_repos[$selected_file]}"
+  repo_error=""
+  if ! copy_index; then
+    repo_error="unable to copy the Git index"
+    repo_status_text=""
+    repo_operation="$(detect_operation)"
+    refresh_file_index
+    diff_dirty=1
+    return 0
   fi
+
+  repo_status_text="$(repo_status 2>&1)" || status_exit=$?
+  operation="$(detect_operation)"
+  conflict_count="$(count_conflicts "$repo_status_text")"
+
+  if [ "$status_exit" -ne 0 ]; then
+    repo_error="$repo_status_text"
+    repo_operation="$operation"
+  elif [ "$conflict_count" -gt 0 ]; then
+    repo_operation="$operation, $conflict_count conflict(s)"
+  else
+    repo_operation="$operation"
+  fi
+
+  git_temp add -N . >/dev/null 2>&1 || true
+  refresh_file_index
+  diff_dirty=1
 }
 
 move_file_selection() {
   local direction="$1"
-  local file_count="${#file_paths[@]}"
-
-  [ "$file_count" -gt 0 ] || return 0
-  if [ "$direction" = "next" ]; then
-    selected_file=$((selected_file + 1))
-    if [ "$selected_file" -ge "$file_count" ]; then
-      selected_file=0
-    fi
-  else
-    selected_file=$((selected_file - 1))
-    if [ "$selected_file" -lt 0 ]; then
-      selected_file=$((file_count - 1))
-    fi
-  fi
-  selected_file_key="${file_keys[$selected_file]}"
-  set_active_repo_for_file
-}
-
-move_repo_selection() {
-  local direction="$1"
-  local repo_count="${#repo_roots[@]}"
-  local file_index=0
+  local row_count=$((${#file_paths[@]} + 1))
 
   if [ "$direction" = "next" ]; then
-    active_repo=$((active_repo + 1))
-    if [ "$active_repo" -ge "$repo_count" ]; then
-      active_repo=0
+    selected_row=$((selected_row + 1))
+    if [ "$selected_row" -ge "$row_count" ]; then
+      selected_row=0
     fi
   else
-    active_repo=$((active_repo - 1))
-    if [ "$active_repo" -lt 0 ]; then
-      active_repo=$((repo_count - 1))
+    selected_row=$((selected_row - 1))
+    if [ "$selected_row" -lt 0 ]; then
+      selected_row=$((row_count - 1))
     fi
   fi
-
-  if [ "${#file_repos[@]}" -gt 0 ]; then
-    for file_index in "${!file_repos[@]}"; do
-      if [ "${file_repos[$file_index]}" -eq "$active_repo" ]; then
-        selected_file="$file_index"
-        selected_file_key="${file_keys[$file_index]}"
-        return 0
-      fi
-    done
-  fi
-}
-
-toggle_selected_file() {
-  local selected_key=""
-  local retained_keys=()
-  local key=""
-
-  [ "${#file_keys[@]}" -gt 0 ] || return 0
-  selected_key="${file_keys[$selected_file]}"
-  if key_is_collapsed "$selected_key"; then
-    if [ "${#collapsed_keys[@]}" -gt 0 ]; then
-      for key in "${collapsed_keys[@]}"; do
-        [ "$key" = "$selected_key" ] || retained_keys+=("$key")
-      done
-    fi
-    collapsed_keys=()
-    if [ "${#retained_keys[@]}" -gt 0 ]; then
-      for key in "${retained_keys[@]}"; do
-        collapsed_keys+=("$key")
-      done
-    fi
+  if [ "$selected_row" -eq 0 ]; then
+    selected_key="__all__"
+    status_window_top=0
   else
-    collapsed_keys+=("$selected_key")
+    selected_key="${file_keys[$((selected_row - 1))]}"
   fi
+  diff_viewport_top=0
+  diff_dirty=1
 }
 
-set_all_collapsed() {
-  local collapse="$1"
-  local key=""
+toggle_status_filter() {
+  local filter="$1"
 
-  collapsed_keys=()
-  if [ "$collapse" = "yes" ]; then
-    if [ "${#file_keys[@]}" -gt 0 ]; then
-      for key in "${file_keys[@]}"; do
-        collapsed_keys+=("$key")
-      done
-    fi
-  fi
-}
-
-clear_screen() {
-  clear 2>/dev/null || printf '\033[H\033[2J'
+  case "$filter" in
+    untracked)
+      if [ "$show_untracked" = "on" ]; then show_untracked="off"; else show_untracked="on"; fi
+      ;;
+    added)
+      if [ "$show_added" = "on" ]; then show_added="off"; else show_added="on"; fi
+      ;;
+    modified)
+      if [ "$show_modified" = "on" ]; then show_modified="off"; else show_modified="on"; fi
+      ;;
+  esac
+  refresh_file_index
+  diff_viewport_top=0
+  diff_dirty=1
 }
 
 pill() {
@@ -584,107 +510,202 @@ key_hint() {
     "$key" "$label"
 }
 
-section_header() {
+diff_append_multiline() {
+  local output="$1"
+  local line=""
+
+  [ -n "$output" ] || return 0
+  while IFS= read -r line; do
+    diff_lines+=("$line")
+  done <<< "$output"
+}
+
+screen_append_section() {
   local fg="$1"
   local bg="$2"
   local label="$3"
 
-  printf '\n'
-  pill "$fg" "$bg" "$label"
-  printf '\n'
+  screen_lines+=("")
+  screen_lines+=("$(pill "$fg" "$bg" "$label")")
 }
 
-repo_has_file() {
-  local repo_index="$1"
-  local file_index="0"
+screen_append_status_section() {
+  local header=""
 
-  if [ "${#file_repos[@]}" -gt 0 ]; then
-    for file_index in "${!file_repos[@]}"; do
-      if [ "${file_repos[$file_index]}" -eq "$repo_index" ]; then
-        return 0
-      fi
-    done
-  fi
-  return 1
+  header="$(pill 15 39 "STATUS")  $(key_hint 'u' "?? $show_untracked")"
+  header="$header  $(key_hint 'a' "A $show_added")"
+  header="$header  $(key_hint 'm' "M $show_modified")"
+  screen_lines+=("")
+  screen_lines+=("$header")
 }
 
-print_file_label() {
-  local file_index="$1"
+screen_append_status_row() {
+  local row_index="$1"
+  local status="$2"
+  local label="$3"
   local marker=" "
-  local state="expanded"
+  local status_color=252
+  local file_color=252
+  local staged_label=""
 
-  if [ "$file_index" -eq "$selected_file" ]; then
+  if [ "$row_index" -eq "$selected_row" ]; then
     marker='>'
   fi
-  if key_is_collapsed "${file_keys[$file_index]}"; then
-    state="collapsed"
-  fi
-  printf '\033[38;5;111m%s [%s] %s\033[0m\n' \
-    "$marker" "$state" "${file_paths[$file_index]}"
-}
-
-render_file_diff() {
-  local repo_index="$1"
-  local path="$2"
-  local staged="$3"
-
-  if [ "$staged" = "yes" ]; then
-    repo_git "$repo_index" --no-pager diff --color=always --staged "${context_args[@]}" -- "$path" 2>/dev/null | \
-      delta "${delta_args[@]}" || true
-  else
-    repo_git "$repo_index" --no-pager diff --color=always "${context_args[@]}" -- "$path" 2>/dev/null | \
-      delta "${delta_args[@]}" || true
-  fi
-}
-
-render_repo() {
-  local repo_index="$1"
-  local file_index=0
-  local active_label=""
-  local status_text="${repo_statuses[$repo_index]}"
-
-  active_label=" "
-  if [ "$repo_index" -eq "$active_repo" ]; then
-    active_label=" *ACTIVE*"
-  fi
-  section_header 15 39 "REPOSITORY $((repo_index + 1))/${#repo_roots[@]}$active_label"
-  printf '\033[38;5;111m%s\033[0m\n' "${repo_roots[$repo_index]}"
-  printf '\033[38;5;244mOperation\033[0m  %s\n' "${repo_operations[$repo_index]}"
-  if [ -n "${repo_errors[$repo_index]}" ]; then
-    printf '\033[38;5;196mGit error\033[0m   %s\n' "${repo_errors[$repo_index]}"
-  fi
-
-  section_header 15 39 "STATUS"
-  if [ -n "$status_text" ]; then
-    printf '%s\n' "$status_text"
-  else
-    printf '(clean)\n'
-  fi
-
-  [ "$mode" != "status" ] || return 0
-  if ! repo_has_file "$repo_index"; then
+  if [ "$status" = "  " ]; then
+    screen_click_rows+=("${#screen_lines[@]}:$row_index")
+    screen_lines+=("$(printf '\033[38;5;111m%s\033[0m \033[38;5;252m%s\033[0m' \
+      "$marker" "$label")")
     return 0
   fi
+  case "${status:0:1}" in
+    A|M|D|R|C|T)
+      status_color=40
+      file_color=40
+      staged_label=" (staged)"
+      ;;
+    *)
+      if [ "$status" = "??" ] || [ "${status:1:1}" != " " ]; then
+        status_color=196
+        file_color=196
+      fi
+      ;;
+  esac
+  screen_click_rows+=("${#screen_lines[@]}:$row_index")
+  screen_lines+=("$(printf '\033[38;5;111m%s\033[0m \033[38;5;%sm%s\033[0m \033[38;5;%sm%s%s\033[0m' \
+    "$marker" "$status_color" "$status" "$file_color" "$label" "$staged_label")")
+}
 
-  section_header 15 28 "DIFFS"
-  for file_index in "${!file_paths[@]}"; do
-    [ "${file_repos[$file_index]}" -eq "$repo_index" ] || continue
-    print_file_label "$file_index"
-    if key_is_collapsed "${file_keys[$file_index]}"; then
-      printf '  (diff collapsed; press space to expand)\n'
-      continue
+render_diff_text() {
+  local kind="$2"
+  local path="${1:-}"
+
+  if [ -n "$path" ]; then
+    if [ "$kind" = "staged" ]; then
+      git_temp --no-pager diff --color=always --staged "${context_args[@]}" -- "$path" 2>/dev/null | \
+        delta "${delta_args[@]}" || true
+    else
+      git_temp --no-pager diff --color=always "${context_args[@]}" -- "$path" 2>/dev/null | \
+        delta "${delta_args[@]}" || true
     fi
-    printf '\033[38;5;244m  STAGED\033[0m\n'
-    render_file_diff "$repo_index" "${file_paths[$file_index]}" yes
-    printf '\033[38;5;244m  UNSTAGED + UNTRACKED\033[0m\n'
-    render_file_diff "$repo_index" "${file_paths[$file_index]}" no
+  elif [ "${#file_paths[@]}" -gt 0 ] && \
+    { [ -n "$search_term" ] || status_filters_active; }; then
+    if [ "$kind" = "staged" ]; then
+      git_temp --no-pager diff --color=always --staged "${context_args[@]}" -- "${file_paths[@]}" 2>/dev/null | \
+        delta "${delta_args[@]}" || true
+    else
+      git_temp --no-pager diff --color=always "${context_args[@]}" -- "${file_paths[@]}" 2>/dev/null | \
+        delta "${delta_args[@]}" || true
+    fi
+  elif [ "$kind" = "staged" ]; then
+    repo_diff diff --color=always --staged "${context_args[@]}" 2>/dev/null | \
+      delta "${delta_args[@]}" || true
+  else
+    repo_diff diff --color=always "${context_args[@]}" 2>/dev/null | \
+      delta "${delta_args[@]}" || true
+  fi
+}
+
+refresh_diff_lines() {
+  local diff_output=""
+  local file_index=0
+  local path=""
+  local status=""
+  local index_state=""
+  local worktree_state=""
+
+  [ "$diff_dirty" -eq 1 ] || return 0
+  diff_lines=()
+  if [ -n "$repo_error" ]; then
+    diff_lines+=($'\033[38;5;196m'"$repo_error"$'\033[0m')
+  elif [ "${#file_paths[@]}" -eq 0 ]; then
+    if [ -n "$repo_status_text" ]; then
+      diff_lines+=("(no changes match the active filters)")
+    else
+      diff_lines+=("(clean)")
+    fi
+  elif [ "$selected_row" -eq 0 ]; then
+    diff_output="$(render_diff_text "" staged)" || diff_output=""
+    if [ -n "$diff_output" ]; then
+      diff_lines+=($'\033[38;5;244mSTAGED\033[0m')
+      diff_append_multiline "$diff_output"
+    fi
+    diff_output="$(render_diff_text "" unstaged)" || diff_output=""
+    if [ -n "$diff_output" ]; then
+      [ "${#diff_lines[@]}" -eq 0 ] || diff_lines+=("")
+      diff_lines+=($'\033[38;5;244mUNSTAGED + UNTRACKED\033[0m')
+      diff_append_multiline "$diff_output"
+    fi
+  else
+    file_index=$((selected_row - 1))
+    path="${file_paths[$file_index]}"
+    status="${file_statuses[$file_index]}"
+    index_state="${status:0:1}"
+    worktree_state="${status:1:1}"
+    if [ "$index_state" != " " ] && [ "$index_state" != "?" ]; then
+      diff_output="$(render_diff_text "$path" staged)" || diff_output=""
+      if [ -n "$diff_output" ]; then
+        diff_lines+=($'\033[38;5;244mSTAGED\033[0m')
+        diff_append_multiline "$diff_output"
+      fi
+    fi
+    if [ "$worktree_state" != " " ] || [ "$status" = "??" ]; then
+      diff_output="$(render_diff_text "$path" unstaged)" || diff_output=""
+      if [ -n "$diff_output" ]; then
+        [ "${#diff_lines[@]}" -eq 0 ] || diff_lines+=("")
+        diff_lines+=($'\033[38;5;244mUNSTAGED + UNTRACKED\033[0m')
+        diff_append_multiline "$diff_output"
+      fi
+    fi
+  fi
+  [ "${#diff_lines[@]}" -gt 0 ] || diff_lines+=("(no diff output)")
+  diff_dirty=0
+}
+
+draw_screen() {
+  local pinned_count="${#screen_lines[@]}"
+  local diff_height=$((terminal_rows - pinned_count))
+  local max_viewport=0
+  local screen_row=0
+  local line=""
+
+  [ "$diff_height" -gt 0 ] || diff_height=1
+  diff_page_size="$diff_height"
+  if [ "${#diff_lines[@]}" -gt "$diff_height" ]; then
+    max_viewport=$((${#diff_lines[@]} - diff_height))
+  fi
+  if [ "$diff_viewport_top" -lt 0 ]; then
+    diff_viewport_top=0
+  elif [ "$diff_viewport_top" -gt "$max_viewport" ]; then
+    diff_viewport_top="$max_viewport"
+  fi
+
+  printf '\033[H\033[2J'
+  for ((screen_row = 0; screen_row < terminal_rows; screen_row++)); do
+    line=""
+    if [ "$screen_row" -lt "$pinned_count" ]; then
+      line="${screen_lines[$screen_row]}"
+      printf '\033[%s;1H%s\033[K' "$((screen_row + 1))" "$line"
+    elif [ $((diff_viewport_top + screen_row - pinned_count)) -lt "${#diff_lines[@]}" ]; then
+      line="${diff_lines[$((diff_viewport_top + screen_row - pinned_count))]}"
+      printf '\033[%s;1H\033[48;5;234m%s\033[0;48;5;234m\033[K\033[0m' \
+        "$((screen_row + 1))" "$line"
+    else
+      printf '\033[%s;1H\033[48;5;234m\033[K\033[0m' "$((screen_row + 1))"
+    fi
   done
+  printf '\033[%s;1H' "$terminal_rows"
 }
 
 render() {
-  local repo_index=0
+  local file_index=0
+  local file_capacity=0
+  local file_end=0
+  local max_window_top=0
+  local status_capacity=0
+  local controls=""
+  local title_line=""
 
-  prepare_state
+  terminal_rows="$(terminal_row_count)"
   context_args=(-U"$context_lines")
   delta_args=(
     --paging=never
@@ -702,85 +723,285 @@ render() {
     delta_args+=(--side-by-side)
   fi
 
-  clear_screen
+  screen_lines=()
+  screen_click_rows=()
   case "$mode" in
     sbs) mode_label="sbs" ;;
-    status) mode_label="status" ;;
     *) mode_label="inline" ;;
   esac
 
-  pill 15 39 "⚡👀 diffy-watch"
-  printf '  '
-  pill 15 60 "$mode_label"
-  printf '  \033[38;5;111m%s\033[0m\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-
-  printf '\033[38;5;244mControls\033[0m  '
-  key_hint 'r' 'refresh'
-  printf '  '
-  key_hint 's/i' 'diff mode'
-  printf '  '
-  key_hint 'n' 'line nums'
-  printf '  '
-  key_hint '/' 'filter'
-  printf '  '
-  key_hint '+/-' 'context'
-  printf '  '
-  key_hint 'j/k' 'files'
-  printf '  '
-  key_hint 'space' 'collapse'
-  printf '  '
-  key_hint '[/]' 'repos'
-  printf '  '
-  key_hint 'l' 'lazygit'
-  printf '\n'
-  printf '\033[38;5;244mContext\033[0m   \033[38;5;255m%s lines\033[0m\n' "$context_lines"
-  printf '\033[38;5;244mActive repo\033[0m \033[38;5;255m%s\033[0m\n' "${repo_roots[$active_repo]}"
-  if [ -n "$file_filter" ]; then
-    printf '\033[38;5;244mFilter\033[0m    \033[38;5;255m%s\033[0m\n' "$file_filter"
+  title_line="$(pill 15 39 ' 👀 diffy-watch')  $(pill 15 60 "$mode_label")"
+  title_line="$title_line  $(printf '\033[38;5;111m%s\033[0m  \033[38;5;246m%s\033[0m' "$(date '+%Y-%m-%d %H:%M:%S')" "$repo_root")"
+  screen_lines+=("$title_line")
+  controls="$(
+    printf '\033[38;5;244mControls\033[0m  '
+    key_hint 'r' 'refresh'
+    printf '  '
+    key_hint 's/i' 'diff mode'
+    printf '  '
+    key_hint 'n' 'line nums'
+    printf '  '
+    key_hint '/' 'search'
+    printf '  '
+    key_hint '+/-' 'context'
+    printf '  '
+    key_hint '↑/↓' 'page diff'
+    printf '  '
+    key_hint '←/→' 'select'
+    printf '  '
+    key_hint 'mouse' 'select/scroll'
+    printf '  '
+    key_hint 'q' 'quit'
+    printf '  '
+    key_hint 'l' 'lazygit'
+  )"
+  screen_lines+=("$controls")
+  screen_lines+=($'\033[38;5;244mContext\033[0m   \033[38;5;255m'"$context_lines lines"$'\033[0m')
+  if [ -n "$search_term" ]; then
+    screen_lines+=($'\033[38;5;244mSearch\033[0m    \033[38;5;255m'"$search_term"$'\033[0m')
+  fi
+  screen_lines+=($'\033[38;5;244mOperation\033[0m  '"$repo_operation")
+  if [ -n "$repo_error" ]; then
+    screen_lines+=($'\033[38;5;196mGit error\033[0m   '"$repo_error")
   fi
 
-  for repo_index in "${!repo_roots[@]}"; do
-    render_repo "$repo_index"
+  screen_append_status_section
+  screen_append_status_row 0 "  " "All diffs"
+  status_capacity=$((terminal_rows / 3))
+  [ "$status_capacity" -ge 2 ] || status_capacity=2
+  file_capacity=$((status_capacity - 1))
+  if [ "$selected_row" -gt 0 ]; then
+    file_index=$((selected_row - 1))
+    if [ "$file_index" -lt "$status_window_top" ]; then
+      status_window_top="$file_index"
+    elif [ "$file_index" -ge $((status_window_top + file_capacity)) ]; then
+      status_window_top=$((file_index - file_capacity + 1))
+    fi
+  fi
+  max_window_top=$((${#file_paths[@]} - file_capacity))
+  [ "$max_window_top" -ge 0 ] || max_window_top=0
+  [ "$status_window_top" -le "$max_window_top" ] || status_window_top="$max_window_top"
+  file_end=$((status_window_top + file_capacity))
+  [ "$file_end" -le "${#file_paths[@]}" ] || file_end="${#file_paths[@]}"
+  for ((file_index = status_window_top; file_index < file_end; file_index++)); do
+    screen_append_status_row "$((file_index + 1))" "${file_statuses[$file_index]}" "${file_paths[$file_index]}"
   done
+
+  refresh_diff_lines
+  screen_append_section 15 28 "DIFFS"
+  draw_screen
 }
 
 launch_lazygit() {
-  clear_screen
+  leave_tui
   if ! command -v lazygit >/dev/null 2>&1; then
     printf 'diffy-watch: lazygit is not installed\n' >&2
+    enter_tui
     return 0
   fi
   (
-    cd "${repo_roots[$active_repo]}"
+    cd "$repo_root"
     command lazygit
   )
+  enter_tui
+  diff_viewport_top=0
+  diff_dirty=1
 }
 
-drain_escape_sequence() {
-  local byte=""
+select_status_at_row() {
+  local mouse_y="$1"
+  local logical_row=$((mouse_y - 1))
+  local entry=""
+  local entry_row=""
+  local row_index=""
 
-  while IFS= read -rsn1 -t 0.01 byte; do
+  if [ "${#screen_click_rows[@]}" -gt 0 ]; then
+    for entry in "${screen_click_rows[@]}"; do
+      entry_row="${entry%%:*}"
+      row_index="${entry#*:}"
+      if [ "$entry_row" -eq "$logical_row" ]; then
+        selected_row="$row_index"
+        if [ "$selected_row" -eq 0 ]; then
+          selected_key="__all__"
+          status_window_top=0
+        else
+          selected_key="${file_keys[$((selected_row - 1))]}"
+        fi
+        diff_viewport_top=0
+        diff_dirty=1
+        force_render=1
+        return 0
+      fi
+    done
+  fi
+}
+
+page_diff() {
+  local direction="$1"
+  local amount=$((diff_page_size - 1))
+
+  [ "$amount" -gt 0 ] || amount=1
+  if [ "$direction" = "next" ]; then
+    diff_viewport_top=$((diff_viewport_top + amount))
+  else
+    diff_viewport_top=$((diff_viewport_top - amount))
+    [ "$diff_viewport_top" -ge 0 ] || diff_viewport_top=0
+  fi
+  force_render=1
+}
+
+handle_mouse_event() {
+  local payload="$1"
+  local coordinates=""
+  local button=""
+  local mouse_x=""
+  local mouse_y=""
+  local action=""
+  local remainder=""
+
+  case "$payload" in
+    *M)
+      action="M"
+      coordinates="${payload%M}"
+      ;;
+    *m)
+      action="m"
+      coordinates="${payload%m}"
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+
+  button="${coordinates%%;*}"
+  remainder="${coordinates#*;}"
+  mouse_x="${remainder%%;*}"
+  mouse_y="${remainder#*;}"
+  [ -n "$mouse_x" ] || return 0
+  [ -n "$mouse_y" ] || return 0
+
+  case "$button" in
+    0)
+      if [ "$action" = "M" ]; then
+        select_status_at_row "$mouse_y"
+      fi
+      ;;
+    64)
+      if [ "$action" = "M" ]; then
+        page_diff previous
+      fi
+      ;;
+    65)
+      if [ "$action" = "M" ]; then
+        page_diff next
+      fi
+      ;;
+  esac
+}
+
+consume_escape_sequence() {
+  local byte=""
+  local payload=""
+
+  IFS= read -rsn1 -t 1 byte || return 0
+  [ "$byte" = "[" ] || return 0
+  IFS= read -rsn1 -t 1 byte || return 0
+  if [ "$byte" = "<" ]; then
+    while IFS= read -rsn1 -t 1 byte; do
+      payload="$payload$byte"
+      case "$byte" in
+        [mM])
+          handle_mouse_event "$payload"
+          return 0
+          ;;
+      esac
+    done
+    return 0
+  fi
+
+  case "$byte" in
+    A)
+      page_diff previous
+      return 0
+      ;;
+    B)
+      page_diff next
+      return 0
+      ;;
+    C)
+      move_file_selection next
+      force_render=1
+      return 0
+      ;;
+    D)
+      move_file_selection previous
+      force_render=1
+      return 0
+      ;;
+  esac
+
+  while :; do
     case "$byte" in
       [A-Za-z~])
-        break
+        return 0
         ;;
     esac
+    IFS= read -rsn1 -t 1 byte || return 0
   done
 }
 
-prompt_file_filter() {
+prompt_search() {
   local input=""
   local rows=""
 
-  rows="$(tput lines 2>/dev/null || printf '24')"
-  printf '\0337'
-  printf '\033[%s;1H\033[0Kfile filter (blank clears): ' "$rows"
+  rows="$(terminal_row_count)"
+  if [ -n "$terminal_stty_state" ]; then
+    stty "$terminal_stty_state" 2>/dev/null || true
+  fi
+  printf '\033[?25h\033[%s;1H\033[2Ksearch (blank clears): ' "$rows"
   if ! IFS= read -r input; then
-    printf '\0338'
+    if [ -n "$terminal_stty_state" ]; then
+      stty -echo 2>/dev/null || true
+    fi
+    printf '\033[?25l'
     return 1
   fi
-  printf '\0338'
-  file_filter="$input"
+  if [ -n "$terminal_stty_state" ]; then
+    stty -echo 2>/dev/null || true
+  fi
+  printf '\033[?25l'
+  search_term="$input"
+}
+
+compute_repo_signature() {
+  local status_text=""
+  local status_line=""
+  local path=""
+  local index_path=""
+
+  status_text="$(repo_status_actual 2>&1)" || true
+  index_path="$(git_path index 2>/dev/null)" || index_path=""
+  {
+    printf '%s\n' "$status_text"
+    if [ -n "$index_path" ] && [ -f "$index_path" ]; then
+      git hash-object "$index_path" 2>/dev/null || true
+    fi
+    while IFS= read -r status_line; do
+      [ -n "$status_line" ] || continue
+      path="${status_line:3}"
+      case "$path" in
+        *' -> '* )
+          path="${path##* -> }"
+          ;;
+      esac
+      if [ -e "$repo_root/$path" ] || [ -L "$repo_root/$path" ]; then
+        git hash-object "$repo_root/$path" 2>/dev/null || true
+      else
+        printf 'missing:%s\n' "$path"
+      fi
+    done <<< "$status_text"
+    detect_operation
+  } | git hash-object --stdin
 }
 
 last_signature=""
@@ -788,46 +1009,57 @@ resize_pending=0
 force_render=1
 
 trap 'resize_pending=1' WINCH
+enter_tui
+refresh_state
+last_signature="$(compute_repo_signature)"
+render
+force_render=0
 
 while true; do
   key=""
   if [ "$resize_pending" -eq 1 ]; then
-    force_render=1
     resize_pending=0
     restore_tmux_focus
+    diff_dirty=1
+    render
   fi
 
   if IFS= read -rsn1 -t "$interval" key; then
     if [ "$key" = $'\e' ]; then
-      drain_escape_sequence
+      consume_escape_sequence
+      if [ "$force_render" -eq 1 ]; then
+        render
+        force_render=0
+      fi
       continue
     fi
     case "$key" in
+      q)
+        exit 0
+        ;;
       r)
+        refresh_state
+        last_signature="$(compute_repo_signature)"
         force_render=1
         ;;
       s)
         if [ "$mode" = "sbs" ]; then
           mode="inline"
         else
-          last_diff_mode="$mode"
           mode="sbs"
         fi
-        if [ "$mode" != "status" ]; then
-          last_diff_mode="$mode"
-        fi
+        diff_viewport_top=0
+        diff_dirty=1
         force_render=1
         ;;
       i)
         if [ "$mode" = "inline" ]; then
           mode="sbs"
         else
-          last_diff_mode="$mode"
           mode="inline"
         fi
-        if [ "$mode" != "status" ]; then
-          last_diff_mode="$mode"
-        fi
+        diff_viewport_top=0
+        diff_dirty=1
         force_render=1
         ;;
       n)
@@ -836,34 +1068,49 @@ while true; do
         else
           show_line_numbers="on"
         fi
+        diff_viewport_top=0
+        diff_dirty=1
         force_render=1
         ;;
       /)
-        if prompt_file_filter; then
+        if prompt_search; then
+          refresh_file_index
+          diff_viewport_top=0
+          diff_dirty=1
           force_render=1
         fi
         ;;
       c)
-        file_filter=""
+        search_term=""
+        refresh_file_index
+        diff_viewport_top=0
+        diff_dirty=1
+        force_render=1
+        ;;
+      u)
+        toggle_status_filter untracked
+        force_render=1
+        ;;
+      a)
+        toggle_status_filter added
+        force_render=1
+        ;;
+      m)
+        toggle_status_filter modified
         force_render=1
         ;;
       +|=)
         context_lines=$((context_lines + 1))
+        diff_viewport_top=0
+        diff_dirty=1
         force_render=1
         ;;
       -)
         if [ "$context_lines" -gt 0 ]; then
           context_lines=$((context_lines - 1))
         fi
-        force_render=1
-        ;;
-      f|d)
-        if [ "$mode" = "status" ]; then
-          mode="$last_diff_mode"
-        else
-          last_diff_mode="$mode"
-          mode="status"
-        fi
+        diff_viewport_top=0
+        diff_dirty=1
         force_render=1
         ;;
       j)
@@ -874,48 +1121,24 @@ while true; do
         move_file_selection previous
         force_render=1
         ;;
-      ' ')
-        toggle_selected_file
-        force_render=1
-        ;;
-      E)
-        set_all_collapsed no
-        force_render=1
-        ;;
-      C)
-        set_all_collapsed yes
-        force_render=1
-        ;;
-      '[')
-        move_repo_selection previous
-        force_render=1
-        ;;
-      ']')
-        move_repo_selection next
-        force_render=1
-        ;;
       l)
         launch_lazygit
+        refresh_state
+        last_signature="$(compute_repo_signature)"
         force_render=1
         ;;
     esac
+    if [ "$force_render" -eq 1 ]; then
+      render
+      force_render=0
+    fi
+    continue
   fi
 
-  signature="$(
-    for repo_index in "${!repo_roots[@]}"; do
-      copy_repo_index "$repo_index" || printf 'index-copy-failed:%s\n' "$repo_index"
-      repo_git "$repo_index" add -N . >/dev/null 2>&1 || true
-      printf 'repo:%s\n' "${repo_roots[$repo_index]}"
-      repo_status "$repo_index" 2>&1 || true
-      repo_diff_all "$repo_index" diff --staged --binary 2>&1 || true
-      repo_diff_all "$repo_index" diff --binary 2>&1 || true
-      repo_operation "$repo_index"
-      printf '\n'
-    done | git -C "${repo_roots[0]}" hash-object --stdin
-  )"
-  if [ "$signature" != "$last_signature" ] || [ "$force_render" -eq 1 ]; then
-    render
+  signature="$(compute_repo_signature)"
+  if [ "$signature" != "$last_signature" ]; then
+    refresh_state
     last_signature="$signature"
-    force_render=0
+    render
   fi
 done
