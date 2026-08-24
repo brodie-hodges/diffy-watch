@@ -23,8 +23,7 @@ While running:
   up / down  scroll selected diff backward/forward
   j / k      select next/previous status row
   left/right select previous/next status row
-  space      scroll the status list
-  shift+space scroll the selected diff
+  space      scroll the selected diff
   mouse      select a status row or scroll diffs
   q          quit
   l          launch lazygit
@@ -42,6 +41,7 @@ show_line_numbers="on"
 search_term=""
 search_active=0
 search_match_position=-1
+search_not_found=0
 show_untracked="on"
 show_added="on"
 show_modified="on"
@@ -579,8 +579,7 @@ screen_append_status_section() {
     'a' "A $show_added" \
     'm' "M $show_modified" \
     '→' 'next file' \
-    '←' 'prev file' \
-    'space' 'more'
+    '←' 'prev file'
 }
 
 screen_append_more_row() {
@@ -593,7 +592,7 @@ screen_append_diffs_section() {
 
   header="$(pill 15 28 'DIFFS')  $(key_hint '↑/↓' 'scroll')"
   header="$header  $(key_hint 'mouse' 'scroll')"
-  header="$header  $(key_hint 'shift+space' 'more')"
+  header="$header  $(key_hint 'space' 'more')"
   if [ "$search_active" -eq 1 ]; then
     header="$header  $(key_hint 'p/n' 'match')"
     header="$header  $(key_hint 'esc' 'exit search')"
@@ -844,9 +843,17 @@ draw_screen() {
     if [ "$screen_row" -lt "$pinned_count" ]; then
       line="${screen_lines[$screen_row]}"
       printf '\033[%s;1H%s\033[K' "$((screen_row + 1))" "$line"
-    elif [ "$diff_overflow" -eq 1 ] && [ "$screen_row" -eq $((terminal_rows - 1)) ]; then
-      printf '\033[%s;1H\033[48;5;234m\033[38;5;244m--more--\033[0;48;5;234m\033[K\033[0m' \
+    elif [ "$search_not_found" -eq 1 ] && [ "$screen_row" -eq $((terminal_rows - 1)) ]; then
+      printf '\033[%s;1H\033[48;5;234m\033[38;5;255m\033[7mPattern not found  (press RETURN)\033[27m\033[0;48;5;234m\033[K\033[0m' \
         "$((screen_row + 1))"
+    elif [ "$diff_overflow" -eq 1 ] && [ "$screen_row" -eq $((terminal_rows - 1)) ]; then
+      if [ "$diff_viewport_top" -ge "$max_viewport" ]; then
+        printf '\033[%s;1H\033[48;5;234m\033[38;5;255m\033[7m(END)\033[27m\033[0;48;5;234m\033[K\033[0m' \
+          "$((screen_row + 1))"
+      else
+        printf '\033[%s;1H\033[48;5;234m\033[38;5;244m\033[1m--More--\033[22m\033[0;48;5;234m\033[K\033[0m' \
+          "$((screen_row + 1))"
+      fi
     elif [ $((diff_viewport_top + screen_row - pinned_count)) -lt "${#diff_lines[@]}" ]; then
       diff_line_number=$((diff_viewport_top + screen_row - pinned_count))
       line="${diff_lines[$diff_line_number]}"
@@ -1193,6 +1200,7 @@ prompt_search() {
   if [ -n "$search_term" ]; then
     search_active=1
     search_match_position=-1
+    search_not_found=0
     rebuild_diff_search
   else
     exit_diff_search
@@ -1203,11 +1211,17 @@ navigate_diff_search() {
   local direction="$1"
   local match_count="${#search_match_lines[@]}"
 
-  [ "$match_count" -gt 0 ] || return 0
   if [ "$direction" = "next" ]; then
+    if [ "$match_count" -eq 0 ] || [ "$search_match_position" -ge $((match_count - 1)) ]; then
+      search_not_found=1
+      force_render=1
+      return 0
+    fi
+    search_not_found=0
     search_match_position=$((search_match_position + 1))
-    [ "$search_match_position" -lt "$match_count" ] || search_match_position=0
   else
+    [ "$match_count" -gt 0 ] || return 0
+    search_not_found=0
     search_match_position=$((search_match_position - 1))
     [ "$search_match_position" -ge 0 ] || search_match_position=$((match_count - 1))
   fi
@@ -1221,6 +1235,7 @@ exit_diff_search() {
   search_match_lines=()
   search_match_offsets=()
   search_match_position=-1
+  search_not_found=0
   force_render=1
 }
 
@@ -1285,6 +1300,11 @@ while true; do
       continue
     fi
     case "$key" in
+      ''|$'\r'|$'\n')
+        if [ "$search_active" -eq 1 ]; then
+          exit_diff_search
+        fi
+        ;;
       q)
         exit 0
         ;;
@@ -1375,9 +1395,7 @@ while true; do
         force_render=1
         ;;
       ' ')
-        if [ "${#file_paths[@]}" -gt "$status_page_size" ]; then
-          scroll_status_next
-        fi
+        page_diff next
         ;;
       l)
         launch_lazygit

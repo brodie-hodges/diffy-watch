@@ -107,11 +107,12 @@ if [[ "$single_screen" != *"STATUS"*"All diffs"*"?? alpha.txt"*"?? beta.txt"*"DI
   echo "single-repository rendering failed" >&2
   exit 1
 fi
-if [[ "$single_screen" != *"[u] ?? on"*"[a] A on"*"[m] M on"*"[→] next file"*"[←] prev file"*"[space] more"* ]]; then
+if [[ "$single_screen" != *"[u] ?? on"*"[a] A on"*"[m] M on"*"[→] next file"*"[←] prev file"* ]] || \
+  [[ "${single_screen%%DIFFS*}" == *"[space]"* ]]; then
   echo "status filter hints were not rendered" >&2
   exit 1
 fi
-if [[ "$single_screen" != *"DIFFS"*"[↑/↓] scroll"*"[mouse] scroll"*"[shift+space] more"* ]]; then
+if [[ "$single_screen" != *"DIFFS"*"[↑/↓] scroll"*"[mouse] scroll"*"[space] more"* ]]; then
   echo "diff scroll hints were not rendered" >&2
   exit 1
 fi
@@ -186,6 +187,24 @@ if [ "$(stable_last_screen "$search_output")" != "$search_first_match" ]; then
   echo "p did not navigate to the previous diff search match" >&2
   exit 1
 fi
+printf 'nn' >&3
+if ! wait_for_screen_pattern "$search_output" 'Pattern not found  (press RETURN)'; then
+  echo "search did not report pattern not found after the final match" >&2
+  exit 1
+fi
+if ! last_screen "$search_output" | grep -Fq $'\033[38;5;255m\033[7mPattern not found  (press RETURN)\033[27m'; then
+  echo "pattern-not-found message was not rendered as an inverse white block" >&2
+  exit 1
+fi
+printf '\n' >&3
+sleep 0.1
+search_returned="$(plain_last_screen "$search_output")"
+if [[ "$search_returned" == *"Search  SEARCH-NEEDLE"* ]]; then
+  echo "return did not exit diff search mode" >&2
+  exit 1
+fi
+printf '/SEARCH-NEEDLE\n' >&3
+wait_for_screen_pattern "$search_output" 'Search.*SEARCH-NEEDLE'
 printf '\033' >&3
 if ! wait_for_screen_pattern "$search_output" 'Operation'; then
   echo "diff search did not redraw after escape" >&2
@@ -347,12 +366,11 @@ fi
 more_row="$(last_screen "$capped_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/--more--/ && /^(\d+) /) { print $1; exit } }')"
 diffs_row="$(last_screen "$capped_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/DIFFS/ && /^(\d+) /) { print $1; exit } }')"
 wrapped_rows="$(last_screen "$capped_output" | perl -0pe 's/\e\[\d+;1H/\n/g; s/\e\[[0-9;?]*[ -\/]*[@-~]//g')"
-if [ "$more_row" -ne 8 ] || [ "$diffs_row" -ne 10 ]; then
+if [ "$more_row" != "8" ] || [ "$diffs_row" != "10" ]; then
   echo "header and status did not use one third of the terminal" >&2
   exit 1
 fi
-if ! printf '%s\n' "$wrapped_rows" | grep -Eq '^ {10}\[q\] quit' || \
-  ! printf '%s\n' "$wrapped_rows" | grep -Eq '^ {12}\[space\] more'; then
+if ! printf '%s\n' "$wrapped_rows" | grep -Eq '^ {10}\[q\] quit'; then
   echo "wrapped hints were not aligned with the first hint" >&2
   exit 1
 fi
@@ -362,13 +380,6 @@ printf '\033[<0;1;%sm' "$more_row" >&3
 sleep 0.1
 if [ "$(stable_last_screen "$capped_output")" = "$capped_before_more" ]; then
   echo "clicking more did not scroll the status list" >&2
-  exit 1
-fi
-capped_before_space="$(stable_last_screen "$capped_output")"
-printf ' ' >&3
-sleep 0.1
-if [ "$(stable_last_screen "$capped_output")" = "$capped_before_space" ]; then
-  echo "space did not scroll the status list" >&2
   exit 1
 fi
 stop_watch "$watch_pid"
@@ -391,16 +402,20 @@ COLUMNS=200 LINES=18 run_watch "$paging_output" "$paging_repo"
 printf '\033[C' >&3
 wait_for_screen_pattern "$paging_output" '>  M long.txt'
 paging_before="$(stable_last_screen "$paging_output")"
-paging_more_row="$(last_screen "$paging_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/--more--/ && /^(\d+) /) { print $1; exit } }')"
-if [ "$paging_more_row" -ne 18 ]; then
-  echo "overflowing diff did not render more at the bottom" >&2
+paging_more_row="$(last_screen "$paging_output" | perl -0ne 's/\e\[(\d+);1H/\n$1 /g; for (split /\n/) { if (/--More--/ && /^(\d+) /) { print $1; exit } }')"
+if [ "$paging_more_row" != "18" ]; then
+  echo "overflowing diff did not render --More-- at the bottom" >&2
   exit 1
 fi
-printf '\033[32;2u' >&3
+if ! last_screen "$paging_output" | grep -Fq $'\033[38;5;244m\033[1m--More--\033[22m'; then
+  echo "diff --More-- marker was not rendered in bold" >&2
+  exit 1
+fi
+printf ' ' >&3
 sleep 0.1
-paging_shift_space="$(stable_last_screen "$paging_output")"
-if [ "$paging_before" = "$paging_shift_space" ]; then
-  echo "shift-space did not page the selected diff" >&2
+paging_space="$(stable_last_screen "$paging_output")"
+if [ "$paging_before" = "$paging_space" ]; then
+  echo "space did not page the selected diff" >&2
   exit 1
 fi
 printf '\033[A' >&3
@@ -420,6 +435,17 @@ printf '\033[A' >&3
 sleep 0.1
 if [ "$(stable_last_screen "$paging_output")" != "$paging_before" ]; then
   echo "left-arrow diff paging failed" >&2
+  exit 1
+fi
+for page in {1..30}; do
+  printf ' ' >&3
+done
+if ! wait_for_screen_pattern "$paging_output" '(END)'; then
+  echo "final overflowing diff page did not render END" >&2
+  exit 1
+fi
+if ! last_screen "$paging_output" | grep -Fq $'\033[38;5;255m\033[7m(END)\033[27m'; then
+  echo "diff END marker was not rendered as an inverse white block" >&2
   exit 1
 fi
 stop_watch "$watch_pid"
