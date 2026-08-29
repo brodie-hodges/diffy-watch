@@ -1,4 +1,4 @@
-# ⚡👀 diffy-watch
+#  👀 diffy-watch
 
 ![Shell](https://img.shields.io/badge/shell-Bash-4EAA25?logo=gnubash&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-blue)
