@@ -103,6 +103,10 @@ touch "$repo/alpha.txt" "$repo/beta.txt"
 single_output="$fixture_root/single-output"
 run_watch "$single_output" "$repo"
 single_screen="$(plain_last_screen "$single_output")"
+if [[ "$single_screen" != *"⚡ 👀 diffy-watch"* ]]; then
+  echo "portable title icon rendering failed" >&2
+  exit 1
+fi
 if [[ "$single_screen" != *"STATUS"*"All diffs"*"?? alpha.txt"*"?? beta.txt"*"DIFFS"* ]]; then
   echo "single-repository rendering failed" >&2
   exit 1

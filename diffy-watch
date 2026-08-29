@@ -912,7 +912,7 @@ render() {
     *) mode_label="inline" ;;
   esac
 
-  title_line="$(pill 15 39 ' 👀 diffy-watch')  $(pill 15 60 "$mode_label")"
+  title_line="$(pill 15 39 '⚡ 👀 diffy-watch')  $(pill 15 60 "$mode_label")"
   title_line="$title_line  "$'\033[38;5;244mContext\033[0m  \033[38;5;255m'"$context_lines lines"$'\033[0m'
   if [ "$search_active" -eq 1 ]; then
     title_line="$title_line  "$'\033[38;5;244mSearch\033[0m  \033[38;5;255m'"$search_term"$'\033[0m'
